@@ -1,490 +1,320 @@
-# Durable Workflow Learning
+# durable-workflow-learning
 
-> Build the same subscription lifecycle **twice** — once with Temporal, once by hand — so you can see exactly what Temporal gives you for free.
+The same subscription billing workflow implemented twice: once with [Temporal](https://temporal.io), once with PostgreSQL + Redis wired together by hand.
+
+The DIY version makes the problems Temporal solves **explicit**. `workflow.sleep(30_000)` is one line. The equivalent in the DIY version is:
+
+```typescript
+// worker.ts — record the timer
+await db.query(`
+  UPDATE subscription_workflows
+  SET state = 'WAITING_FOR_TRIAL_END',
+      trial_end_at = NOW() + INTERVAL '30 seconds'
+  WHERE id = $1
+`, [workflowId]);
+
+// scheduler.ts — separate process, polls every 2 seconds
+const due = await db.query(`
+  SELECT * FROM subscription_workflows
+  WHERE state = 'WAITING_FOR_TRIAL_END' AND trial_end_at <= NOW()
+`);
+for (const wf of due.rows) await redis.rpush('diy:tasks:ready', chargeTask(wf));
+
+// reconciler.ts — separate process, in case scheduler was down when timer fired
+if (wf.state === 'WAITING_FOR_TRIAL_END' && wf.trial_end_at < Date.now()) {
+  await redis.rpush('diy:tasks:ready', chargeTask(wf));
+}
+```
+
+That's one timer. The same pattern repeats for retries, idempotency, crash recovery, and distributed locks. This repo lets you run both versions side-by-side, break them, and watch the recovery.
 
 ---
 
-## What is this?
+## The workflow
 
-Most engineers use Temporal without ever understanding the distributed systems problems it solves. This repo makes those problems **visible** by implementing an identical subscription workflow in two ways:
-
-| | Temporal Version | DIY Version |
-|---|---|---|
-| **Stack** | Temporal TypeScript SDK | PostgreSQL + Redis + Node.js |
-| **Timers** | `workflow.sleep()` | `trial_end_at` column + Scheduler process |
-| **Crash recovery** | Automatic (server reassigns) | `reconciler.ts` — detects expired locks, re-enqueues |
-| **Retry** | Config in `proxyActivities` | Exponential backoff via Redis sorted set |
-| **Idempotency** | History-based replay | `idempotency_keys` table — checked before every activity |
-| **Cancellation** | `defineSignal` + `setHandler` | HTTP POST → DB write → task enqueue |
-| **Workflow state** | Implicit in execution point | Explicit `state` column in PostgreSQL |
-
-**The goal isn't production polish. The goal is to make concepts easy to grasp, inspect, break, and understand.**
-
----
-
-## The Business Workflow
-
-A subscription lifecycle — the same steps run in both versions:
+A subscription lifecycle with a 30-day free trial (30 seconds in the demo):
 
 ```
-Customer signs up
-    │
-    ▼
-Send welcome email
-    │
-    ▼
-Wait 30 days (30 seconds in demo)  ◄──── cancellation signal can arrive here
-    │                                              │
-    ▼ (trial ends)                                 ▼ (cancelled)
-Charge monthly fee ($29.99)           Process cancellation
-    │                                 Send "sorry to see you go" email
-    ▼
-Send end-of-trial email
-Send receipt email
-    │
-    ▼
+sign-up
+  │
+  ▼
+sendWelcomeEmail
+  │
+  ▼
+wait 30 days ──── cancel signal arrives ──► processSubscriptionCancellation
+  │                                         sendSorryToSeeYouGoEmail
+  ▼
+chargeMonthlyFee           (retries on transient failure, idempotent)
+  │
+  ▼
+sendEndOfTrialEmail
+sendMonthlyChargeEmail
+  │
+  ▼
 COMPLETED
 ```
 
-**Accelerated time:** 30 seconds = 30 days.
+---
+
+## What each concept maps to
+
+| | Temporal | DIY |
+|---|---|---|
+| Workflow state | implicit — current `await` in history | `state VARCHAR` column in `subscription_workflows` |
+| Durable timer | `workflow.sleep()` / `condition(fn, timeout)` | `trial_end_at TIMESTAMPTZ` + `scheduler.ts` |
+| Activity retry | `retry` config in `proxyActivities` | ZADD to `diy:tasks:delayed` sorted set with backoff score |
+| Idempotency | history replay — completed activities skipped | `idempotency_keys` table, checked before every execution |
+| Cancellation | `defineSignal` + `setHandler` | HTTP POST → UPDATE state + RPUSH cancel task |
+| Crash recovery | server reassigns after heartbeat timeout | `reconciler.ts` — deletes expired locks, re-enqueues |
+| Concurrent execution | server serialises workflow tasks | `workflow_locks` table with TTL |
+| Dead letter | workflow fails after max retries | `dead_letter_tasks` table |
 
 ---
 
-## Architecture
-
-### Temporal Version
+## Structure
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Temporal Server                          │
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
-│  │  Workflow    │    │   Activity   │    │  Workflow History  │  │
-│  │  Task Queue  │    │  Task Queue  │    │   (PostgreSQL)     │  │
-│  └──────┬───────┘    └──────┬───────┘    └───────────────────┘  │
-└─────────┼────────────────── ┼─────────────────────────────────── ┘
-          │                   │
-          ▼                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Temporal Worker                           │
-│                                                                  │
-│  ┌────────────────────────┐   ┌──────────────────────────────┐  │
-│  │   Workflow Sandbox     │   │    Activity Executor         │  │
-│  │   (V8 Isolate)         │   │    (Normal Node.js)          │  │
-│  │                        │   │                              │  │
-│  │  Deterministic replay  │   │  sendWelcomeEmail()          │  │
-│  │  of workflow history   │   │  chargeMonthlyFee()          │  │
-│  │                        │   │  sendEndOfTrialEmail()       │  │
-│  │  sleep() ──► TimerCmd  │   │  sendMonthlyChargeEmail()    │  │
-│  │  condition() ─► Wait   │   │  processSubscriptionCancel() │  │
-│  │  signal ──► Handler    │   │  sendSorryToSeeYouGoEmail()  │  │
-│  └────────────────────────┘   └──────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
+temporal-version/src/
+  workflows/subscriptionWorkflow.ts   the entire workflow — ~100 lines
+  activities/subscriptionActivities.ts
+  worker.ts                           registers workflows + activities with Temporal
+  api.ts / cli.ts
 
-**Key insight:** Temporal's workflow code runs in a deterministic sandbox. Every `await` produces an event in workflow history. If the worker crashes, the server replays history to restore execution state — no activity is re-run.
+diy-version/src/
+  db/schema.sql                       6 tables — read this first
+  orchestrator/stateMachine.ts        15 explicit states + transition table
+  queue/redisQueue.ts                 READY list + DELAYED sorted set
+  worker.ts                           lock → idempotency → execute → commit → enqueue
+  scheduler.ts                        fires durable timers (polls trial_end_at)
+  reconciler.ts                       repairs workflows after worker crashes
+  api.ts / cli.ts
 
-### DIY Version
-
-```
-┌────────────┐   HTTP POST    ┌──────────────────────────────────┐
-│  CLI / API │───────────────►│            API Server            │
-└────────────┘                │  • Creates workflow row in DB    │
-                              │  • RPUSHes first task to Redis   │
-                              └──────────┬───────────────────────┘
-                                         │
-              ┌──────────────────────────▼──────────────────────┐
-              │                   PostgreSQL                     │
-              │                                                  │
-              │  subscription_workflows  (state machine)         │
-              │  workflow_events         (audit log)             │
-              │  activity_attempts       (retry history)         │
-              │  idempotency_keys        (deduplication)         │
-              │  workflow_locks          (distributed mutex)     │
-              │  dead_letter_tasks       (exhausted retries)     │
-              └──────────────────────────────────────────────────┘
-                         ▲               ▲               ▲
-                         │               │               │
-              ┌──────────┴──┐   ┌────────┴─────┐  ┌─────┴──────────┐
-              │   Worker    │   │  Scheduler   │  │  Reconciler    │
-              │             │   │              │  │                │
-              │ BLPOP Redis │   │ Poll DB for  │  │ Release expired│
-              │ Acquire lock│   │ trial_end_at │  │ locks          │
-              │ Check idem. │   │ ≤ NOW()      │  │                │
-              │ Execute act.│   │              │  │ Detect stuck   │
-              │ Commit state│   │ RPUSH charge │  │ workflows      │
-              │ RPUSH next  │   │ task         │  │                │
-              └──────┬──────┘   └──────────────┘  │ Re-enqueue    │
-                     │                             │ lost tasks    │
-              ┌──────▼──────────────────┐          └────────────────┘
-              │          Redis          │
-              │                        │
-              │  diy:tasks:ready  LIST  │  ← immediate dispatch
-              │  diy:tasks:delayed ZSET │  ← retry with backoff
-              └─────────────────────────┘
-```
-
-**Key insight:** Every guarantee Temporal provides automatically — timers, crash recovery, retry, idempotency — is a separate piece of code you have to write yourself.
-
----
-
-## DIY State Machine
-
-```
-                        ┌─────────┐
-                        │ STARTED │
-                        └────┬────┘
-                             │ first task enqueued
-                             ▼
-               ┌────────────────────────────┐
-               │  WELCOME_EMAIL_SCHEDULED   │
-               └──────────────┬─────────────┘
-                              │ worker executes sendWelcomeEmail
-                              ▼
-               ┌──────────────────────────┐
-               │    WELCOME_EMAIL_SENT    │
-               └──────────────┬───────────┘
-                              │ trial_end_at = NOW() + 30s
-                              ▼
-               ┌──────────────────────────┐
-               │   WAITING_FOR_TRIAL_END  │ ◄── cancel API can interrupt here
-               └──────────────┬───────────┘
-                              │ scheduler: trial_end_at ≤ NOW()
-                              ▼
-               ┌──────────────────────────┐
-               │     CHARGE_SCHEDULED     │
-               └──────────────┬───────────┘
-                              │ worker starts chargeMonthlyFee
-                              ▼
-               ┌──────────────────────────┐
-               │        CHARGING          │ ◄── crash here = reconciler repairs
-               └──────────────┬───────────┘
-                              │ charge succeeds
-                              ▼
-               ┌──────────────────────────┐
-               │         CHARGED          │
-               └──────────────┬───────────┘
-                              │ sendEndOfTrialEmail
-                              ▼
-               ┌──────────────────────────┐
-               │  END_OF_TRIAL_EMAIL_SENT │
-               └──────────────┬───────────┘
-                              │ sendMonthlyChargeEmail
-                              ▼
-               ┌──────────────────────────┐
-               │        COMPLETED         │ ✓
-               └──────────────────────────┘
-
-
-  Cancellation path (can enter from WAITING_FOR_TRIAL_END or earlier):
-
-  CANCELLATION_REQUESTED → CANCELLING → CANCELLED ✓
-
-  Failure path (max retries exhausted):
-
-  Any state → FAILED  (task moved to dead_letter_tasks)
+docs/
+  architecture.md                     sequence diagrams for both versions
+  comparison.md                       concept-by-concept mapping
+  failure-scenarios.md                7 failure modes analysed for both systems
 ```
 
 ---
 
-## Quick Start
+## Running it
 
-### Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- Node.js 20+
-- `npm`
-
-### Run Everything in Docker
+Requires Docker and Node.js 20+.
 
 ```bash
 git clone https://github.com/HackerM0nk/durable-workflow-learning
 cd durable-workflow-learning
+```
 
+**Option 1 — everything in Docker:**
+
+```bash
 docker compose up
 ```
 
-Services started:
-
-| Service | URL |
-|---------|-----|
-| Temporal Server | `localhost:7233` |
-| **Temporal UI** | **http://localhost:8080** |
-| PostgreSQL | `localhost:5432` |
-| Redis | `localhost:6379` |
-| Temporal HTTP API | `localhost:3000` |
-| DIY HTTP API | `localhost:3001` |
-
-### Run Infrastructure in Docker, Workers Locally
-
-Better for learning — you can kill/restart workers easily and see clean logs.
+**Option 2 — infrastructure in Docker, workers local** (easier to kill things):
 
 ```bash
-# Terminal 1 — Infrastructure only
+# infrastructure
 docker compose up postgres redis temporal temporal-ui
 
-# Terminal 2 — Temporal worker
-cd temporal-version && npm install
-TEMPORAL_ADDRESS=localhost:7233 node dist/worker.js
+# build both versions
+(cd temporal-version && npm install && npm run build)
+(cd diy-version && npm install && npm run build)
+```
 
-# Terminal 3 — Temporal API
-cd temporal-version
-TEMPORAL_ADDRESS=localhost:7233 PORT=3000 node dist/api.js
+Then in separate terminals:
 
-# Terminal 4 — DIY API (runs migrations on first start)
-cd diy-version && npm install
+```bash
+# Temporal worker
+TEMPORAL_ADDRESS=localhost:7233 node temporal-version/dist/worker.js
+
+# Temporal HTTP API
+TEMPORAL_ADDRESS=localhost:7233 PORT=3000 node temporal-version/dist/api.js
+
+# DIY API (also runs migrations)
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 RUN_MIGRATIONS=true node dist/api.js
+REDIS_URL=redis://localhost:6379 RUN_MIGRATIONS=true \
+node diy-version/dist/api.js
 
-# Terminal 5 — DIY Worker
-cd diy-version
+# DIY worker
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 node dist/worker.js
+REDIS_URL=redis://localhost:6379 \
+node diy-version/dist/worker.js
 
-# Terminal 6 — DIY Scheduler (fires timers)
-cd diy-version
+# DIY scheduler (fires timers)
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 node dist/scheduler.js
+REDIS_URL=redis://localhost:6379 \
+node diy-version/dist/scheduler.js
 
-# Terminal 7 — DIY Reconciler (crash recovery)
-cd diy-version
+# DIY reconciler (crash recovery)
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 node dist/reconciler.js
+REDIS_URL=redis://localhost:6379 \
+node diy-version/dist/reconciler.js
+```
+
+Temporal UI: http://localhost:8080
+
+---
+
+## Demo
+
+### Start a subscription
+
+```bash
+# Temporal
+npx ts-node temporal-version/src/cli.ts start customer-123
+
+# DIY
+npx ts-node diy-version/src/cli.ts start customer-456
+```
+
+Both run the same workflow. The Temporal version finishes in ~35 seconds. The DIY version does too — you can watch the state change in PostgreSQL:
+
+```sql
+-- in psql: postgresql://postgres:postgres@localhost:5432/diy_workflows
+SELECT state, trial_end_at, metadata FROM subscription_workflows;
+SELECT event_type, event_data FROM workflow_events ORDER BY id;
+SELECT activity_type, attempt_number, status FROM activity_attempts;
+```
+
+### Cancel during the trial
+
+```bash
+npx ts-node temporal-version/src/cli.ts cancel customer-123 "switched-plans"
+npx ts-node diy-version/src/cli.ts cancel customer-456 "switched-plans"
+```
+
+### Check status
+
+```bash
+npx ts-node temporal-version/src/cli.ts status customer-123
+npx ts-node temporal-version/src/cli.ts history customer-123   # prints all history events
+
+npx ts-node diy-version/src/cli.ts status customer-456
+npx ts-node diy-version/src/cli.ts history customer-456        # prints workflow_events + activity_attempts
 ```
 
 ---
 
-## Demo Commands
+## Crash recovery demo
 
 ### Temporal
 
 ```bash
-cd temporal-version
+npx ts-node temporal-version/src/cli.ts start crash-test
 
-# Start a subscription (30s trial)
-npx ts-node src/cli.ts start customer-123
+# kill the worker mid-flight
+pkill -f "node dist/worker"
 
-# Cancel during trial
-npx ts-node src/cli.ts cancel customer-123 "switched-plans"
+# workflow stays RUNNING — the timer lives in Temporal's DB, not in the worker process
+npx ts-node temporal-version/src/cli.ts status crash-test
 
-# Check status
-npx ts-node src/cli.ts status customer-123
-
-# View full workflow history
-npx ts-node src/cli.ts history customer-123
-
-# Temporal UI (visual history + event timeline)
-open http://localhost:8080
+# restart — it resumes where it stopped, sendWelcomeEmail does not run again
+TEMPORAL_ADDRESS=localhost:7233 node temporal-version/dist/worker.js
 ```
 
 ### DIY
 
 ```bash
-cd diy-version
-
-# Start a subscription
-npx ts-node src/cli.ts start customer-456
-
-# Cancel during trial
-npx ts-node src/cli.ts cancel customer-456 "switched-plans"
-
-# Check workflow state
-npx ts-node src/cli.ts status customer-456
-
-# View events + activity attempts
-npx ts-node src/cli.ts history customer-456
-
-# Inspect the database directly
-psql postgresql://postgres:postgres@localhost:5432/diy_workflows
-
-# Useful queries:
-# SELECT customer_id, state, trial_end_at FROM subscription_workflows;
-# SELECT event_type, event_data FROM workflow_events ORDER BY id;
-# SELECT activity_type, attempt_number, status FROM activity_attempts;
-# SELECT key FROM idempotency_keys;
-# SELECT * FROM workflow_locks;
-# SELECT * FROM dead_letter_tasks;
-```
-
----
-
-## Demo: Crash Recovery
-
-### Temporal — Worker Crash
-
-```bash
-# 1. Start a workflow
-npx ts-node temporal-version/src/cli.ts start crash-test
-
-# 2. Kill the Temporal worker (Ctrl+C or docker kill dw-temporal-worker)
-
-# 3. Workflow stays RUNNING — timer is server-side, not in worker memory
-npx ts-node temporal-version/src/cli.ts status crash-test
-
-# 4. Restart the worker
-TEMPORAL_ADDRESS=localhost:7233 node temporal-version/dist/worker.js
-
-# 5. Workflow resumes from exactly where it left off.
-#    Watch the logs — sendWelcomeEmail does NOT run again.
-```
-
-### DIY — Worker Crash
-
-```bash
-# 1. Start a workflow
 npx ts-node diy-version/src/cli.ts start crash-diy
 
-# 2. Kill the DIY worker (Ctrl+C)
+# kill the worker
+pkill -f "node dist/worker"
 
-# 3. Check — workflow is stuck, lock still held
+# the lock is still in workflow_locks, workflow is stuck
 psql postgresql://postgres:postgres@localhost:5432/diy_workflows \
-  -c "SELECT state FROM subscription_workflows WHERE customer_id='crash-diy';"
+  -c "SELECT state FROM subscription_workflows WHERE customer_id = 'crash-diy';"
 psql postgresql://postgres:postgres@localhost:5432/diy_workflows \
   -c "SELECT locked_by, expires_at FROM workflow_locks;"
 
-# 4. Wait ~40s — reconciler releases lock, detects stuck state, re-enqueues
-# [reconciler] 🔓 Released 1 expired lock(s)
-# [reconciler] 🔧 Found 1 stuck workflow(s)
-# [reconciler] ↺ Re-enqueued task | task=CHARGE_MONTHLY_FEE
-
-# 5. Restart worker
+# wait ~40s — reconciler releases the lock, detects the stuck workflow, re-enqueues the task
+# restart the worker — it picks up the task, checks idempotency, continues
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 node diy-version/dist/worker.js
-
-# 6. Workflow completes. Idempotency key prevents any duplicate charges.
+REDIS_URL=redis://localhost:6379 \
+node diy-version/dist/worker.js
 ```
 
-## Demo: Retry (Charge Fails Twice)
+### Retry demo (charge fails twice)
 
 ```bash
-# Temporal
 SIMULATE_CHARGE_FAILURE=true TEMPORAL_ADDRESS=localhost:7233 \
   node temporal-version/dist/worker.js
+npx ts-node temporal-version/src/cli.ts start retry-test
+# Temporal UI shows: ActivityTaskFailed × 2, ActivityTaskCompleted × 1
 
-npx ts-node temporal-version/src/cli.ts start retry-demo
-# → Watch retries in Temporal UI: ActivityTaskFailed x2, ActivityTaskCompleted x1
-
-# DIY
 SIMULATE_CHARGE_FAILURE=true \
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows \
-REDIS_URL=redis://localhost:6379 node diy-version/dist/worker.js
-
-npx ts-node diy-version/src/cli.ts start retry-demo-diy
-# → After ~35s, check:
+REDIS_URL=redis://localhost:6379 \
+node diy-version/dist/worker.js
+npx ts-node diy-version/src/cli.ts start retry-test-diy
+# After ~35s:
 psql postgresql://postgres:postgres@localhost:5432/diy_workflows \
-  -c "SELECT activity_type, attempt_number, status FROM activity_attempts;"
-# CHARGE_MONTHLY_FEE  1  FAILED
-# CHARGE_MONTHLY_FEE  2  FAILED
-# CHARGE_MONTHLY_FEE  3  COMPLETED
+  -c "SELECT activity_type, attempt_number, status FROM activity_attempts ORDER BY scheduled_at;"
 ```
 
 ---
 
-## Failure Scenarios
+## Failure scenarios
 
-| # | Scenario | Temporal | DIY |
-|---|----------|----------|-----|
-| 1 | Worker crash after email | History records completion — email not re-sent | Reconciler re-enqueues; idempotency key prevents duplicate |
-| 2 | Worker crash during trial wait | Timer is server-side — survives all crashes | `trial_end_at` in DB; scheduler still fires |
-| 3 | Charge fails 2x then succeeds | Auto-retry via `proxyActivities` config | Exponential backoff via Redis sorted set |
-| 4 | Duplicate task delivery | Server deduplicates workflow tasks | `idempotency_keys` table checked before every activity |
-| 5 | Cancel during trial | Signal queued server-side; delivered on next activation | HTTP POST → DB write → task enqueued immediately |
-| 6 | DB updated, queue publish fails | **Impossible** — queue IS the state store | Reconciler detects state ≠ queue; re-enqueues |
-| 7 | Stuck workflow (lock expired) | Built-in heartbeat + reassignment | Reconciler: `DELETE workflow_locks WHERE expires_at < NOW()` |
+| Scenario | Temporal | DIY |
+|---|---|---|
+| Worker crashes after email sends | History records the completion. On restart, replay skips the activity — email not re-sent. | Reconciler re-enqueues. Idempotency key on the email service prevents a duplicate send. |
+| Worker crashes while waiting for trial | Timer is stored server-side. Worker crash is irrelevant — it fires regardless. | `trial_end_at` is in PostgreSQL. Scheduler is a separate process and still running. |
+| Charge fails, retries with backoff | Automatic — configured in `proxyActivities`. | Worker writes to `diy:tasks:delayed` sorted set with score `now + 2^attempt * 1000`. Scheduler promotes it when the score elapses. |
+| Same task delivered twice | Temporal deduplicates workflow tasks at the server. | `idempotency_keys` table — `INSERT ... ON CONFLICT DO NOTHING` before every activity. |
+| Cancel during trial wait | Signal written to history, delivered on next workflow task. | HTTP POST updates `state = CANCELLATION_REQUESTED`, enqueues the cancel task immediately. |
+| DB updated, Redis publish fails | Not possible — Temporal's task queue and state are the same system. | Reconciler detects `state = CHARGED` with no pending task and re-enqueues `SEND_END_OF_TRIAL_EMAIL`. |
+| Worker holds lock, crashes | Server detects heartbeat timeout, reassigns. | Reconciler runs `DELETE FROM workflow_locks WHERE expires_at < NOW()`, then re-enqueues. |
 
-Detailed analysis in [`docs/failure-scenarios.md`](docs/failure-scenarios.md).
-
----
-
-## Repository Structure
-
-```
-durable-workflow-learning/
-│
-├── temporal-version/
-│   └── src/
-│       ├── workflows/
-│       │   └── subscriptionWorkflow.ts   ← ~100 lines of durable workflow code
-│       ├── activities/
-│       │   └── subscriptionActivities.ts
-│       ├── worker.ts                     ← polls Temporal, runs sandbox + activities
-│       ├── api.ts                        ← HTTP API
-│       └── cli.ts                        ← CLI: start / cancel / status / history
-│
-├── diy-version/
-│   └── src/
-│       ├── db/
-│       │   └── schema.sql                ← 6 tables with explanatory comments
-│       ├── orchestrator/
-│       │   └── stateMachine.ts           ← explicit state machine (15 states)
-│       ├── queue/
-│       │   └── redisQueue.ts             ← READY list + DELAYED sorted set
-│       ├── activities/
-│       │   └── subscriptionActivities.ts ← same activities, called directly
-│       ├── worker.ts      ← lock → idempotency → execute → commit → enqueue next
-│       ├── scheduler.ts   ← polls trial_end_at (replaces workflow.sleep)
-│       ├── reconciler.ts  ← crash recovery (replaces Temporal's heartbeat system)
-│       ├── api.ts
-│       └── cli.ts
-│
-├── docs/
-│   ├── architecture.md         ← deep-dive with sequence diagrams
-│   ├── comparison.md           ← side-by-side concept mapping
-│   └── failure-scenarios.md    ← 7 scenarios, both systems analysed
-│
-└── scripts/
-    ├── demo-temporal.sh
-    ├── demo-diy.sh
-    └── failure-scenarios/      ← runnable scripts for each scenario
-```
+Full analysis with exact state transitions and event records: [`docs/failure-scenarios.md`](docs/failure-scenarios.md)
 
 ---
 
-## The Core Lesson
+## DIY state machine
 
 ```
-workflow.sleep(30_000)         ← 1 line in Temporal
+STARTED
+  └─► WELCOME_EMAIL_SCHEDULED ─► WELCOME_EMAIL_SENT
+                                        │
+                                        ▼
+                              WAITING_FOR_TRIAL_END ◄── cancel arrives here
+                               │              │
+                 timer fires   │              │  cancel
+                               ▼              ▼
+                     CHARGE_SCHEDULED   CANCELLATION_REQUESTED
+                               │              │
+                               ▼              ▼
+                           CHARGING      CANCELLING
+                               │              │
+                               ▼              ▼
+                           CHARGED        CANCELLED ✓
+                               │
+                               ▼
+                     END_OF_TRIAL_EMAIL_SENT
+                               │
+                               ▼
+                           COMPLETED ✓
+
+  FAILED ✗ — any state, when max retries are exhausted
 ```
 
-In DIY, that 1 line requires:
-
-```typescript
-// In worker.ts — set the timer
-await client.query(`
-  UPDATE subscription_workflows
-  SET state = 'WAITING_FOR_TRIAL_END',
-      trial_end_at = NOW() + INTERVAL '30 seconds'
-  WHERE id = $1
-`);
-
-// In scheduler.ts — poll for expiry (separate process)
-const expired = await query(`
-  SELECT * FROM subscription_workflows
-  WHERE state = 'WAITING_FOR_TRIAL_END'
-    AND trial_end_at <= NOW()
-`);
-for (const wf of expired.rows) {
-  await enqueueImmediate({ taskType: 'CHARGE_MONTHLY_FEE', ... });
-}
-
-// In reconciler.ts — if scheduler was down when timer fired
-if (workflow.state === 'WAITING_FOR_TRIAL_END' && workflow.trial_end_at < now) {
-  await enqueueImmediate({ taskType: 'CHARGE_MONTHLY_FEE', ... });
-}
-```
-
-Multiply this pattern across timers, retries, idempotency, crash recovery, and distributed locks — and you have a rough idea of what Temporal replaces.
+In Temporal, these states are implicit — the current `await` in the workflow function is the state. In the DIY version they are a `VARCHAR` column you can `SELECT` at any time.
 
 ---
 
-## Tech Stack
+## DIY database tables
 
-- **Language:** TypeScript (single language across both versions)
-- **Temporal SDK:** `@temporalio/worker`, `@temporalio/client`, `@temporalio/workflow` v1.9
-- **Database:** PostgreSQL 15
-- **Queue:** Redis 7
-- **Runtime:** Node.js 20+
-- **Infrastructure:** Docker Compose
+```sql
+subscription_workflows   canonical state + trial_end_at timer + metadata
+workflow_events          append-only log of every state transition and activity result
+activity_attempts        one row per execution attempt, with status and error
+idempotency_keys         completed activity fingerprints — keyed by workflowId:activityType
+workflow_locks           distributed mutex with TTL
+dead_letter_tasks        tasks that exhausted retries
+```
+
+Schema with column-level comments: [`diy-version/src/db/schema.sql`](diy-version/src/db/schema.sql)
 
 ---
 
