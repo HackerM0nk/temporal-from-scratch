@@ -1,0 +1,32 @@
+{
+  "name": "diy-version",
+  "version": "1.0.0",
+  "description": "Subscription workflow implemented with hand-rolled durable orchestration",
+  "scripts": {
+    "build": "tsc",
+    "worker": "ts-node src/worker.ts",
+    "scheduler": "ts-node src/scheduler.ts",
+    "reconciler": "ts-node src/reconciler.ts",
+    "api": "ts-node src/api.ts",
+    "cli": "ts-node src/cli.ts",
+    "migrate": "ts-node src/db/migrations.ts",
+    "start:worker": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows REDIS_URL=redis://localhost:6379 ts-node src/worker.ts",
+    "start:scheduler": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows REDIS_URL=redis://localhost:6379 ts-node src/scheduler.ts",
+    "start:reconciler": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows REDIS_URL=redis://localhost:6379 ts-node src/reconciler.ts",
+    "start:api": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diy_workflows REDIS_URL=redis://localhost:6379 RUN_MIGRATIONS=true ts-node src/api.ts"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.10.9",
+    "@types/uuid": "^9.0.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

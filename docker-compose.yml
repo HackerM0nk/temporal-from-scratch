@@ -1,0 +1,187 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Durable Workflow Learning — Docker Compose
+#
+# Infrastructure:      postgres, redis, temporal, temporal-ui
+# Temporal version:    temporal-worker (can also run locally)
+# DIY version:         diy-worker, diy-scheduler, diy-reconciler, diy-api
+#
+# Quick start:
+#   docker compose up                          # everything
+#   docker compose up postgres redis temporal temporal-ui   # infra only
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Shared Infrastructure ───────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: dw-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: dw-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Temporal Infrastructure ─────────────────────────────────────────────────
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: dw-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PWD: postgres
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    volumes:
+      - ./docker/temporal-config:/etc/temporal/config/dynamicconfig
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: dw-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:8080"
+    ports:
+      - "8080:8080"
+
+  # ── Temporal Version ────────────────────────────────────────────────────────
+
+  temporal-worker:
+    build:
+      context: ./temporal-version
+      dockerfile: Dockerfile
+    container_name: dw-temporal-worker
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TASK_QUEUE: subscription-workflows
+      # Set to 'true' to demo charge failure + retry
+      SIMULATE_CHARGE_FAILURE: "false"
+      # Accelerated time: 30s = 30 days
+      TRIAL_PERIOD_MS: "30000"
+    restart: on-failure
+
+  temporal-api:
+    build:
+      context: ./temporal-version
+      dockerfile: Dockerfile
+    container_name: dw-temporal-api
+    command: ["node", "dist/api.js"]
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TASK_QUEUE: subscription-workflows
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    restart: on-failure
+
+  # ── DIY Version ─────────────────────────────────────────────────────────────
+
+  diy-worker:
+    build:
+      context: ./diy-version
+      dockerfile: Dockerfile
+    container_name: dw-diy-worker
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
+      REDIS_URL: redis://redis:6379
+      WORKER_ID: diy-worker-1
+      # Set to 'true' to demo charge failure + retry
+      SIMULATE_CHARGE_FAILURE: "false"
+    restart: on-failure
+
+  diy-scheduler:
+    build:
+      context: ./diy-version
+      dockerfile: Dockerfile
+    container_name: dw-diy-scheduler
+    command: ["node", "dist/scheduler.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
+      REDIS_URL: redis://redis:6379
+    restart: on-failure
+
+  diy-reconciler:
+    build:
+      context: ./diy-version
+      dockerfile: Dockerfile
+    container_name: dw-diy-reconciler
+    command: ["node", "dist/reconciler.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
+      REDIS_URL: redis://redis:6379
+    restart: on-failure
+
+  diy-api:
+    build:
+      context: ./diy-version
+      dockerfile: Dockerfile
+    container_name: dw-diy-api
+    command: ["node", "dist/api.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
+      REDIS_URL: redis://redis:6379
+      PORT: "3001"
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "3001:3001"
+    restart: on-failure
+
+volumes:
+  postgres_data:
