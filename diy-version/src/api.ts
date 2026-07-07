@@ -1,13 +1,7 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// DIY Workflow API
-//
-// HTTP API for starting, cancelling, and inspecting DIY subscription workflows.
-// ─────────────────────────────────────────────────────────────────────────────
-
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { waitForDb, query, withTransaction } from './db/client';
-import { waitForRedis, enqueueImmediate, queueStats } from './queue/redisQueue';
+import { waitForRabbitMQ, publishTask, queueDepth } from './queue/rabbitmq';
 import { runMigrations } from './db/migrations';
 import { WorkflowState, TaskType } from './orchestrator/stateMachine';
 import type { QueueTask, WorkflowRow } from './types';
@@ -16,73 +10,58 @@ const PORT = parseInt(process.env.PORT ?? '3001', 10);
 
 async function main() {
   await waitForDb();
-  if (process.env.RUN_MIGRATIONS === 'true') {
-    await runMigrations();
-  }
-  await waitForRedis();
+  if (process.env.RUN_MIGRATIONS === 'true') await runMigrations();
+  await waitForRabbitMQ();
 
   const app = express();
   app.use(express.json());
 
-  // ── POST /workflows/subscription ──────────────────────────────────────────
+  // POST /workflows/subscription
   app.post('/workflows/subscription', async (req, res) => {
     const { customerId } = req.body;
-    if (!customerId) return res.status(400).json({ error: 'customerId is required' });
+    if (!customerId) return res.status(400).json({ error: 'customerId required' });
 
-    // Check for existing active workflow (idempotent start)
     const existing = await query<WorkflowRow>(
       'SELECT * FROM subscription_workflows WHERE customer_id = $1', [customerId]
     );
-    if (existing.rows.length > 0) {
+    if (existing.rows.length) {
       const wf = existing.rows[0];
-      if (!([WorkflowState.COMPLETED, WorkflowState.CANCELLED, WorkflowState.FAILED] as string[]).includes(wf.state)) {
-        return res.status(409).json({
-          error: `Workflow for ${customerId} already running`,
-          workflowId: wf.id,
-          state: wf.state,
-        });
+      const terminal = [WorkflowState.COMPLETED, WorkflowState.CANCELLED, WorkflowState.FAILED] as string[];
+      if (!terminal.includes(wf.state)) {
+        return res.status(409).json({ error: `Workflow for ${customerId} already active`, state: wf.state });
       }
     }
 
     const workflowId = uuidv4();
-    console.log(`[diy-api] Starting workflow | workflowId=${workflowId} | customerId=${customerId}`);
+    console.log(`[api] Starting workflow | workflowId=${workflowId} | customer=${customerId}`);
 
-    // Create workflow record + enqueue first task in one transaction
     await withTransaction(async (client) => {
-      await client.query(`
-        INSERT INTO subscription_workflows (id, customer_id, state)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (customer_id) DO UPDATE
-          SET id = EXCLUDED.id, state = EXCLUDED.state, updated_at = NOW()
-          WHERE subscription_workflows.state IN ('COMPLETED', 'CANCELLED', 'FAILED')
-      `, [workflowId, customerId, WorkflowState.WELCOME_EMAIL_SCHEDULED]);
-
-      await client.query(`
-        INSERT INTO workflow_events (workflow_id, event_type, event_data)
-        VALUES ($1, 'WORKFLOW_STARTED', $2)
-      `, [workflowId, JSON.stringify({ customerId })]);
+      await client.query(
+        `INSERT INTO subscription_workflows (id, customer_id, state)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (customer_id) DO UPDATE
+           SET id=$1, state=$3, metadata='{}', trial_end_at=NULL, cancellation_reason=NULL, updated_at=NOW()
+           WHERE subscription_workflows.state IN ('COMPLETED','CANCELLED','FAILED')`,
+        [workflowId, customerId, WorkflowState.WELCOME_EMAIL_SCHEDULED],
+      );
+      await client.query(
+        `INSERT INTO workflow_events (workflow_id, event_type, event_data) VALUES ($1, 'WORKFLOW_STARTED', $2)`,
+        [workflowId, JSON.stringify({ customerId })],
+      );
     });
 
-    const task: QueueTask = {
+    await publishTask({
       taskId: uuidv4(),
       workflowId,
       customerId,
       taskType: TaskType.SEND_WELCOME_EMAIL,
       attempt: 1,
-    };
-
-    await enqueueImmediate(task);
-
-    console.log(`[diy-api] ✓ Workflow started | workflowId=${workflowId}`);
-    return res.status(201).json({
-      workflowId,
-      customerId,
-      state: WorkflowState.WELCOME_EMAIL_SCHEDULED,
-      message: `Subscription workflow started for ${customerId}`,
     });
+
+    return res.status(201).json({ workflowId, customerId, state: WorkflowState.WELCOME_EMAIL_SCHEDULED });
   });
 
-  // ── POST /workflows/subscription/:customerId/cancel ───────────────────────
+  // POST /workflows/subscription/:customerId/cancel
   app.post('/workflows/subscription/:customerId/cancel', async (req, res) => {
     const { customerId } = req.params;
     const reason = req.body.reason ?? 'user-requested';
@@ -90,115 +69,70 @@ async function main() {
     const result = await query<WorkflowRow>(
       'SELECT * FROM subscription_workflows WHERE customer_id = $1', [customerId]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: `No workflow found for ${customerId}` });
+    if (!result.rows.length) return res.status(404).json({ error: `No workflow for ${customerId}` });
+    const wf = result.rows[0];
+
+    const terminal = [WorkflowState.COMPLETED, WorkflowState.CANCELLED, WorkflowState.FAILED] as string[];
+    if (terminal.includes(wf.state)) {
+      return res.status(409).json({ error: `Workflow is already in terminal state: ${wf.state}` });
     }
 
-    const workflow = result.rows[0];
-
-    // Cannot cancel a terminal workflow
-    if ([WorkflowState.COMPLETED, WorkflowState.CANCELLED, WorkflowState.FAILED].includes(workflow.state as WorkflowState)) {
-      return res.status(409).json({ error: `Workflow is in terminal state: ${workflow.state}` });
-    }
-
-    // KEY CONCEPT: This is the DIY equivalent of Temporal's signal mechanism.
-    // We write directly to the database rather than delivering a message to
-    // a running workflow instance. The worker reads the cancellation state
-    // on its next wake-up.
-    //
-    // If the workflow is in WAITING_FOR_TRIAL_END, the scheduler won't fire
-    // the charge task (it checks current state). The cancellation task gets
-    // enqueued immediately instead.
-    console.log(`[diy-api] Cancelling workflow | workflowId=${workflow.id} | reason=${reason}`);
-
+    console.log(`[api] Cancelling | workflowId=${wf.id} | reason=${reason}`);
     await withTransaction(async (client) => {
-      await client.query(`
-        UPDATE subscription_workflows
-        SET state = $1,
-            cancellation_reason = $2,
-            updated_at = NOW()
-        WHERE id = $3
-      `, [WorkflowState.CANCELLATION_REQUESTED, reason, workflow.id]);
-
-      await client.query(`
-        INSERT INTO workflow_events (workflow_id, event_type, event_data)
-        VALUES ($1, 'CANCELLATION_REQUESTED', $2)
-      `, [workflow.id, JSON.stringify({ reason, requestedAt: new Date().toISOString() })]);
+      await client.query(
+        `UPDATE subscription_workflows SET state=$1, cancellation_reason=$2, updated_at=NOW() WHERE id=$3`,
+        [WorkflowState.CANCELLATION_REQUESTED, reason, wf.id],
+      );
+      await client.query(
+        `INSERT INTO workflow_events (workflow_id, event_type, event_data) VALUES ($1, 'CANCELLATION_REQUESTED', $2)`,
+        [wf.id, JSON.stringify({ reason })],
+      );
     });
 
-    // Enqueue the cancellation task
-    const task: QueueTask = {
+    await publishTask({
       taskId: uuidv4(),
-      workflowId: workflow.id,
+      workflowId: wf.id,
       customerId,
       taskType: TaskType.PROCESS_CANCELLATION,
       attempt: 1,
       context: { reason },
-    };
-    await enqueueImmediate(task);
-
-    console.log(`[diy-api] ✓ Cancellation requested | workflowId=${workflow.id}`);
-    return res.json({
-      workflowId: workflow.id,
-      state: WorkflowState.CANCELLATION_REQUESTED,
-      message: `Cancellation initiated for ${customerId}`,
     });
+
+    return res.json({ workflowId: wf.id, state: WorkflowState.CANCELLATION_REQUESTED });
   });
 
-  // ── GET /workflows/subscription/:customerId ───────────────────────────────
+  // GET /workflows/subscription/:customerId
   app.get('/workflows/subscription/:customerId', async (req, res) => {
-    const { customerId } = req.params;
-    const wfResult = await query<WorkflowRow>(
-      'SELECT * FROM subscription_workflows WHERE customer_id = $1', [customerId]
+    const result = await query<WorkflowRow>(
+      'SELECT * FROM subscription_workflows WHERE customer_id = $1', [req.params.customerId]
     );
-    if (wfResult.rows.length === 0) {
-      return res.status(404).json({ error: `No workflow found for ${customerId}` });
-    }
-    return res.json(wfResult.rows[0]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    return res.json(result.rows[0]);
   });
 
-  // ── GET /workflows/subscription/:customerId/history ───────────────────────
+  // GET /workflows/subscription/:customerId/history
   app.get('/workflows/subscription/:customerId/history', async (req, res) => {
-    const { customerId } = req.params;
-    const wfResult = await query<WorkflowRow>(
-      'SELECT * FROM subscription_workflows WHERE customer_id = $1', [customerId]
+    const wf = await query<WorkflowRow>(
+      'SELECT * FROM subscription_workflows WHERE customer_id = $1', [req.params.customerId]
     );
-    if (wfResult.rows.length === 0) {
-      return res.status(404).json({ error: `No workflow found for ${customerId}` });
-    }
-    const workflowId = wfResult.rows[0].id;
-    const events = await query(
-      'SELECT * FROM workflow_events WHERE workflow_id = $1 ORDER BY id',
-      [workflowId]
-    );
-    const attempts = await query(
-      'SELECT * FROM activity_attempts WHERE workflow_id = $1 ORDER BY scheduled_at',
-      [workflowId]
-    );
-    return res.json({
-      workflow: wfResult.rows[0],
-      events: events.rows,
-      activityAttempts: attempts.rows,
-    });
+    if (!wf.rows.length) return res.status(404).json({ error: 'Not found' });
+    const id = wf.rows[0].id;
+    const [events, attempts] = await Promise.all([
+      query('SELECT * FROM workflow_events WHERE workflow_id=$1 ORDER BY id', [id]),
+      query('SELECT * FROM activity_attempts WHERE workflow_id=$1 ORDER BY scheduled_at', [id]),
+    ]);
+    return res.json({ workflow: wf.rows[0], events: events.rows, activityAttempts: attempts.rows });
   });
 
-  // ── GET /queue/stats ──────────────────────────────────────────────────────
+  // GET /queue/stats
   app.get('/queue/stats', async (_req, res) => {
-    const stats = await queueStats();
+    const stats = await queueDepth();
     return res.json(stats);
   });
 
   app.listen(PORT, () => {
-    console.log(`[diy-api] HTTP API listening on port ${PORT}`);
-    console.log(`[diy-api] POST   /workflows/subscription`);
-    console.log(`[diy-api] POST   /workflows/subscription/:customerId/cancel`);
-    console.log(`[diy-api] GET    /workflows/subscription/:customerId`);
-    console.log(`[diy-api] GET    /workflows/subscription/:customerId/history`);
-    console.log(`[diy-api] GET    /queue/stats`);
+    console.log(`[api] Listening on :${PORT}`);
   });
 }
 
-main().catch((err) => {
-  console.error('[diy-api] Fatal error:', err);
-  process.exit(1);
-});
+main().catch((err) => { console.error('[api] Fatal:', err); process.exit(1); });

@@ -121,6 +121,38 @@ CREATE TABLE IF NOT EXISTS workflow_locks (
 );
 
 
+-- ── scheduled_tasks ─────────────────────────────────────────────────────────
+-- Delayed and retry tasks that should be published to RabbitMQ at a future time.
+-- This replaces the Redis sorted set (ZSET) we previously used for retry backoff.
+--
+-- Why PostgreSQL instead of a RabbitMQ delay plugin?
+--   The RabbitMQ delayed-message plugin is not in the official image and adds
+--   operational complexity. Storing delays in PostgreSQL is simpler, visible,
+--   and transactional — you can see exactly what's waiting and when.
+--
+-- The scheduler polls this table every 2 seconds and publishes any tasks whose
+-- execute_after has passed. published_at is set atomically to prevent the
+-- scheduler from publishing the same task twice (e.g., after a scheduler restart).
+--
+-- Temporal equivalent: none needed — Temporal's server handles retry scheduling
+-- and timer delivery automatically as part of workflow history.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+  id             UUID PRIMARY KEY,
+  workflow_id    UUID NOT NULL REFERENCES subscription_workflows(id),
+  customer_id    VARCHAR(255) NOT NULL,
+  task_type      VARCHAR(100) NOT NULL,
+  execute_after  TIMESTAMPTZ NOT NULL,
+  attempt        INT NOT NULL DEFAULT 1,
+  context        JSONB NOT NULL DEFAULT '{}',
+  published_at   TIMESTAMPTZ,   -- NULL = not yet sent to RabbitMQ
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+  ON scheduled_tasks(execute_after)
+  WHERE published_at IS NULL;
+
+
 -- ── dead_letter_tasks ────────────────────────────────────────────────────────
 -- Tasks that have exhausted all retry attempts. These represent workflows that
 -- have failed permanently and require manual intervention.

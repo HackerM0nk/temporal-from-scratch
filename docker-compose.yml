@@ -1,13 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Durable Workflow Learning — Docker Compose
 #
-# Infrastructure:      postgres, redis, temporal, temporal-ui
+# Infrastructure:      postgres, rabbitmq, temporal, temporal-ui
 # Temporal version:    temporal-worker (can also run locally)
 # DIY version:         diy-worker, diy-scheduler, diy-reconciler, diy-api
 #
 # Quick start:
-#   docker compose up                          # everything
-#   docker compose up postgres redis temporal temporal-ui   # infra only
+#   docker compose up                                        # everything
+#   docker compose up postgres rabbitmq temporal temporal-ui # infra only
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -32,16 +32,26 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    container_name: dw-redis
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: dw-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      # RABBITMQ_ERLANG_COOKIE bypasses the .erlang.cookie file, avoiding
+      # permission issues that can occur with Docker volumes on some hosts.
+      RABBITMQ_ERLANG_COOKIE: "DURABLE_WORKFLOW_LEARNING"
     ports:
-      - "6379:6379"
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI — http://localhost:15672
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
 
   # ── Temporal Infrastructure ─────────────────────────────────────────────────
 
@@ -121,11 +131,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      rabbitmq:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
-      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       WORKER_ID: diy-worker-1
       # Set to 'true' to demo charge failure + retry
       SIMULATE_CHARGE_FAILURE: "false"
@@ -140,11 +150,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      rabbitmq:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
-      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
     restart: on-failure
 
   diy-reconciler:
@@ -156,11 +166,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
-      REDIS_URL: redis://redis:6379
     restart: on-failure
 
   diy-api:
@@ -172,11 +179,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      rabbitmq:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/diy_workflows
-      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       PORT: "3001"
       RUN_MIGRATIONS: "true"
     ports:
@@ -185,3 +192,4 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:

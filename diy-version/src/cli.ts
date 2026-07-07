@@ -146,9 +146,10 @@ async function main() {
 
     case 'inspect': {
       const stats = await httpRequest('GET', '/queue/stats');
-      console.log('\n── Queue Stats ────────────────────────────────────────');
-      console.log(`  Ready queue depth   : ${stats.ready}`);
-      console.log(`  Delayed queue depth : ${stats.delayed}`);
+      console.log('\n── RabbitMQ Queue Stats ───────────────────────────────');
+      console.log(`  Messages ready    : ${stats.ready}`);
+      console.log(`  Messages unacked  : ${stats.unacked}`);
+      console.log(`  Management UI     : http://localhost:15672  (guest/guest)`);
       break;
     }
 
