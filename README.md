@@ -21,7 +21,7 @@ The DIY version implements every guarantee the Temporal version inherits for fre
 
 Your workflow looks like ordinary sequential TypeScript. Under the hood, every `await` writes an event to an append-only history log. If the worker crashes, Temporal replays that history to restore execution state — completed steps are skipped, timers still fire, signals still deliver.
 
-![Temporal Architecture](docs/diagrams/temporal-architecture.svg)
+![Temporal Architecture](docs/diagrams/temporal-architecture.png)
 
 ---
 
@@ -29,7 +29,7 @@ Your workflow looks like ordinary sequential TypeScript. Under the hood, every `
 
 The DIY version makes the hidden machinery explicit: four processes, six PostgreSQL tables, one RabbitMQ queue, and five failure modes to handle at every step.
 
-![DIY Architecture](docs/diagrams/diy-architecture.svg)
+![DIY Architecture](docs/diagrams/diy-architecture.png)
 
 ---
 
