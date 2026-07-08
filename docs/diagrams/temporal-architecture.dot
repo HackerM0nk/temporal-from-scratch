@@ -1,0 +1,62 @@
+digraph {
+  rankdir=TB
+  bgcolor="white"
+  fontname="Helvetica"
+  compound=true
+  nodesep=0.7
+  ranksep=0.9
+  pad=0.5
+  label="Temporal — Durable Execution Engine\nEvery await is crash-proof. Timers, retries, and signals are handled by the server — not by your worker."
+  labelloc=b labeljust=c fontsize=11 fontcolor="#64748B"
+
+  node [fontname="Helvetica" style=filled fontsize=11 margin="0.2,0.12"]
+  edge [fontname="Helvetica" fontsize=9 penwidth=1.5 color="#64748B" fontcolor="#475569"]
+
+  subgraph cluster_code {
+    label="Your Application" fontsize=12 fontname="Helvetica Bold"
+    bgcolor="#F1F5F9" color="#94A3B8" style=rounded penwidth=1.5
+    wf [label="subscriptionWorkflow.ts\n\nawait sendWelcomeEmail(customerId)\nawait condition(isCancelled, 30 days)    \nawait chargeMonthlyFee(customerId)\nawait sendEndOfTrialEmail(customerId)"
+        shape=note fillcolor="#0F172A" fontcolor="#E2E8F0" fontsize=10 fontname="Courier,Courier New"]
+  }
+
+  subgraph cluster_server {
+    label="Temporal Server" fontsize=13 fontname="Helvetica Bold" fontcolor="white"
+    bgcolor="#0F172A" color="#7C3AED" style=rounded penwidth=2.5
+
+    hist  [label="Workflow History\n(PostgreSQL)"
+           shape=cylinder fillcolor="#336791" fontcolor="white"
+           width=1.9 height=1.1 fontsize=11]
+
+    timer [label="Durable Timer Store\nsleep(30 days) persisted here\nNot in worker process memory"
+           shape=box3d fillcolor="#B45309" fontcolor="white" fontsize=10]
+
+    queue [label="Task Queues\n────────────\nWorkflow Tasks\nActivity Tasks"
+           shape=component fillcolor="#166534" fontcolor="white" fontsize=10]
+
+    { rank=same; hist; timer; queue }
+  }
+
+  subgraph cluster_worker {
+    label="Temporal Worker  —  your Node.js process  (stateless)" fontsize=12 fontname="Helvetica Bold" fontcolor="white"
+    bgcolor="#1E293B" color="#374151" style=rounded penwidth=1.5
+
+    sandbox [label="Workflow Sandbox  (V8 Isolate)\n────────────────────────────\nDeterministic replay of workflow history.\nCompleted activities are skipped — not re-executed.\nWorker crash = resume from last history event."
+             shape=box fillcolor="#5B21B6" fontcolor="white" width=3.2 fontsize=10]
+
+    exec    [label="Activity Executor  (Node.js)\n────────────────────────────\nReal I/O: email service, Stripe, databases.\nSends idempotency keys to external APIs.\nRetried automatically by server on failure."
+             shape=box fillcolor="#15803D" fontcolor="white" width=3.2 fontsize=10]
+
+    { rank=same; sandbox; exec }
+  }
+
+  wf -> hist [lhead=cluster_server ltail=cluster_code
+              label="  gRPC  (start · signal · query)"
+              color="#7C3AED" fontcolor="#7C3AED" penwidth=2.5]
+
+  hist -> sandbox [ltail=cluster_server lhead=cluster_worker
+                   label="  workflow tasks\n  activity tasks" penwidth=2]
+
+  exec -> hist [ltail=cluster_worker
+                label="results recorded in history  "
+                style=dashed color="#94A3B8" fontcolor="#94A3B8"]
+}

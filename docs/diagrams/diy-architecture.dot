@@ -1,0 +1,55 @@
+digraph {
+  rankdir=LR
+  bgcolor="white"
+  fontname="Helvetica"
+  nodesep=0.6
+  ranksep=1.0
+  pad=0.5
+  label="DIY — Build All of This to Match Temporal's Guarantees\n4 processes · 6 PostgreSQL tables · 1 RabbitMQ queue · handle 5 failure modes per task"
+  labelloc=b labeljust=c fontsize=11 fontcolor="#64748B"
+
+  node [fontname="Helvetica" style=filled fontsize=10 margin="0.2,0.12"]
+  edge [fontname="Helvetica" fontsize=9 penwidth=1.5]
+
+  // ── Column 1: PostgreSQL ──
+  pg [label="PostgreSQL\ndiy_workflows\n────────────\nsubscription_workflows\n  state · trial_end_at\nworkflow_events\n  audit log\nactivity_attempts\n  retry history\nidempotency_keys\n  deduplication\nworkflow_locks\n  distributed mutex\nscheduled_tasks\n  delayed retries"
+      shape=cylinder fillcolor="#336791" fontcolor="white" width=2.1 height=3.0 fontsize=10]
+
+  // ── Column 2: Processes ──
+  api [label="API Server  :3001\n─────────────────\nPOST /workflows/subscription\nPOST /workflows/:id/cancel\nGET  /workflows/:id"
+       shape=box3d fillcolor="#1E293B" fontcolor="white" width=2.6 fontsize=10]
+
+  worker [label="Worker Process  (Node.js)\n─────────────────────────────\n1  basicConsume  (msg stays unacked)\n2  acquire workflow_lock\n3  check idempotency_keys\n4  execute activity\n5  ATOMIC DB commit:\n    INSERT idempotency_keys\n    UPDATE workflow state\n    INSERT workflow_events\n6  PUBLISH next task to RabbitMQ\n7  channel.ack(msg)"
+          shape=box fillcolor="#1E293B" fontcolor="white" width=3.0 fontsize=10]
+
+  sched [label="Scheduler  (Node.js)\n─────────────────────────────\nPolls every 2 seconds:\ntrial_end_at ≤ NOW  →  PUBLISH charge\nscheduled_tasks due  →  PUBLISH retry\n\nTemporal equivalent:\nworkflow.sleep()"
+         shape=box fillcolor="#92400E" fontcolor="white" width=2.6 fontsize=10]
+
+  recon [label="Reconciler  (Node.js)\n─────────────────────────────\nPolls every 10 seconds:\nDELETE expired workflow_locks\nStuck workflows  →  INSERT scheduled_tasks\nTimed-out attempts  →  mark FAILED\n\nTemporal equivalent:\nserver heartbeat detection"
+         shape=box fillcolor="#7F1D1D" fontcolor="white" width=2.6 fontsize=10]
+
+  // ── Column 3: RabbitMQ ──
+  mq [label="RabbitMQ\ndiy.tasks\n────────────\nAMQP · durable\nmanual ack\nprefetch = 1\n\ncrash before ack\n→ broker redelivers\nto next consumer"
+      shape=component fillcolor="#C2410C" fontcolor="white" width=1.8 fontsize=10]
+
+  // ── Rankings ──
+  { rank=same; pg; api; mq }
+  { rank=same; sched; recon }
+
+  // ── Edges ──
+  api -> pg    [label="INSERT state\n+ event log" color="#336791" fontcolor="#336791"]
+  api -> mq    [label="PUBLISH\nSEND_WELCOME_EMAIL" color="#C2410C" fontcolor="#C2410C"]
+
+  mq -> worker [label=" consume" color="#C2410C" fontcolor="#C2410C" penwidth=2.5]
+  worker -> pg [label="READ/\nWRITE" color="#336791" fontcolor="#336791" penwidth=2.5]
+  worker -> mq [label="PUBLISH next\ntask  " color="#C2410C" fontcolor="#C2410C" style=dashed]
+
+  sched -> pg  [label="SELECT timers " color="#92400E" fontcolor="#92400E"]
+  sched -> mq  [label="PUBLISH\ncharge/retry" color="#C2410C" fontcolor="#C2410C"]
+
+  recon -> pg  [label="repair\nlocks + tasks " color="#7F1D1D" fontcolor="#7F1D1D"]
+
+  // ── Invisible layout aids ──
+  worker -> sched [style=invis]
+  worker -> recon [style=invis]
+}
