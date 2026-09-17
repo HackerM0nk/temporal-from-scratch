@@ -8,10 +8,12 @@
 //   ✓ Only pure TypeScript + @temporalio/workflow imports
 //
 // KEY CONCEPT — Durability via Event Sourcing:
-//   Every await in this function corresponds to an event in the workflow
-//   history. If the worker crashes and restarts, Temporal REPLAYS the history
-//   to restore the workflow's execution state — advancing each await point
-//   without actually re-executing the underlying side effect.
+//   Temporal SDK operations such as scheduling Activities, starting Timers,
+//   and receiving Signals produce Commands and Events in workflow history.
+//   Ordinary JavaScript awaits and local assignments do not. If the worker
+//   crashes and restarts, Temporal REPLAYS the history to reconstruct logical
+//   execution state. Recorded Activity results are supplied during replay;
+//   Temporal does not restore the old process's JavaScript stack or RAM.
 //
 //   Crash at step 3? On restart, steps 1-2 are replayed (instantly, from
 //   history), and execution resumes at step 3. The external world is never
@@ -79,14 +81,16 @@ export async function subscriptionWorkflow(customerId: string): Promise<void> {
   const { workflowId, runId } = workflowInfo();
 
   // Mutable state that signal handlers can mutate.
-  // Temporal serializes signal delivery, so no race conditions here.
+  // This synchronous handler runs atomically on the Workflow thread. Async
+  // handlers can interleave at await points and need replay-safe coordination.
   let isCancelled = false;
   let cancellationReason = 'unknown';
 
   // ── Signal Handler ───────────────────────────────────────────────────────────
   // setHandler() registers a handler for incoming signals.
-  // Temporal guarantees at-least-once delivery: if a signal arrives while the
-  // workflow is sleeping, it is queued and delivered when the workflow wakes.
+  // The Signal is durably recorded even while no Worker is available. Temporal
+  // deduplicates retried client requests by request ID, but applications should
+  // include an event ID when the same logical Signal may be sent independently.
   setHandler(cancelSubscriptionSignal, ({ reason }) => {
     log.info('[SIGNAL] Cancel request received', { customerId, reason });
     isCancelled = true;

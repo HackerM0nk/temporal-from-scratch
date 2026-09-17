@@ -1,161 +1,103 @@
-# Side-by-Side Comparison: Temporal vs DIY
+# Side-by-Side Comparison: Temporal and the DIY System
 
-## Concept Mapping Table
+This comparison is scoped to the subscription example. The DIY code demonstrates the mechanisms an application team starts assembling. It does not reproduce Temporal Server's full distributed-systems guarantees.
 
-| Concept | Temporal | DIY System |
-|---------|----------|-----------|
-| **Workflow** | A function that `await`s activities and sleeps. Its execution point is implicit in history. | A row in `subscription_workflows` with an explicit `state` column. |
-| **Activity** | An `async function` exported from activities module. Temporal dispatches it to a worker. | Same `async function`, called directly by the worker after lock + idempotency checks. |
-| **Workflow History** | Append-only event log maintained by Temporal Server. Used for replay to reconstruct execution state after crash. | `workflow_events` table. Append-only audit log. NOT used for replay (we replay from `state` column). |
-| **Timer / Sleep** | `workflow.sleep(ms)` or `condition(fn, timeout)`. Timer stored server-side. Fires even if all workers are down. | `trial_end_at TIMESTAMPTZ` column + Scheduler process polls `SELECT WHERE trial_end_at <= NOW()`. If scheduler is down, timer fires late. |
-| **Task Queue** | Named queue managed by Temporal Server. Workers long-poll for tasks. | Redis LIST (`diy:tasks:ready`). Workers use `BLPOP`. Scheduler uses sorted set for delayed tasks. |
-| **Worker** | Process that polls Temporal Server for both workflow tasks (replay) and activity tasks (execute). | Process that polls Redis for tasks, acquires a DB lock, and directly executes activities. |
-| **Retry** | Configured in `proxyActivities` retry policy. Temporal handles scheduling retries with backoff automatically. | Worker re-enqueues to Redis sorted set (`diy:tasks:delayed`) with score = `now + backoff_ms`. Scheduler promotes when due. |
-| **Cancellation** | Signal (`defineSignal`, `setHandler`). Delivered in-process to the running workflow coroutine. | HTTP POST to API → updates `state` column to `CANCELLATION_REQUESTED` → worker reads state on next iteration. |
-| **Replay** | Temporal replays workflow code from history on every workflow task. Completed activities are skipped (their results injected from history). | Not used. Worker checks `state` column to determine where the workflow is and what to do next. |
-| **Idempotency** | History-based: a completed `ActivityTaskCompleted` event means "don't run again." Activity-level: idempotency keys with external APIs. | Explicit `idempotency_keys` table. Worker always checks before executing. Also needed for external API calls. |
-| **Reconciliation** | Built-in. Temporal Server detects heartbeat timeouts, reschedules tasks, and handles worker failures automatically. | Explicit `reconciler.ts` process. Releases expired locks, detects stuck workflows, re-enqueues lost tasks. Runs every 10s. |
-| **Sticky Worker** | Temporal caches workflow state on the worker that last processed it for performance. Falls back to full replay if unavailable. | Explicit `workflow_locks` table with TTL. Only one worker processes a given workflow at a time. |
-| **Namespace** | Logical isolation for workflows. Multiple namespaces in one Temporal cluster. | Not implemented (would be a `tenant_id` column). |
+## Concept mapping
 
----
+| Concept | Temporal | DIY implementation |
+|---|---|---|
+| Workflow | Deterministic function reconstructed from History | Row in `subscription_workflows` plus an explicit state machine |
+| Activity | Retryable external operation dispatched by Temporal | Function invoked by the RabbitMQ consumer |
+| Event History | Authoritative ordered event stream used for replay | `workflow_events` audit log; current state is authoritative |
+| Durable timer | Server Timer Event | `trial_end_at` or `scheduled_tasks.execute_after` plus Scheduler polling |
+| Ready task delivery | Temporal Task Queue and Worker polling | Durable RabbitMQ queue with manual acknowledgements |
+| Delayed retry | Temporal retry state and Timer | PostgreSQL `scheduled_tasks` row promoted by Scheduler |
+| Worker failure | Workflow Task replay; Activity timeout or heartbeat | RabbitMQ redelivery, lock expiry, and Reconciler backstop |
+| Process state | Rebuilt from code and Event History | Explicit `state` and metadata columns |
+| Completed-step replay | Recorded Activity result is injected during replay | `idempotency_keys` result is read and the task is skipped |
+| External side-effect safety | Application-level idempotency or reconciliation | Application-level idempotency or reconciliation |
+| Cancellation request | Durable Signal plus cooperative cancellation | API state transition plus cancellation task |
+| Visibility | Temporal UI, APIs, Search Attributes, metrics | SQL queries, RabbitMQ UI, logs |
 
-## Code Comparison: Starting a Workflow
+## The key distinction: replay is not retry
 
-**Temporal:**
-```typescript
-// One line — Temporal handles all durability
-const handle = await client.workflow.start(subscriptionWorkflow, {
-  args: [customerId],
-  taskQueue: 'subscription-workflows',
+Workflow replay re-executes deterministic orchestration code to reconstruct state. It does not re-run a completed Activity merely because replay reached the corresponding call.
+
+Activity retry is different. If an Activity made an external change but failed before Temporal recorded completion, it may execute again. The external API still needs a stable idempotency key or a reconciliation algorithm.
+
+The DIY system has the same ambiguity. A consumer can send an email and die before committing its idempotency record. RabbitMQ redelivers the message, so the email provider must recognize the same operation key.
+
+## Starting a Workflow
+
+Temporal:
+
+```ts
+await client.workflow.start(subscriptionWorkflow, {
   workflowId: `subscription-${customerId}`,
+  taskQueue: 'subscription-workflows',
+  args: [customerId],
 });
 ```
 
-**DIY:**
-```typescript
-// We must explicitly:
-// 1. Create workflow row in DB
-// 2. Record event
-// 3. Enqueue first task
-await withTransaction(async (client) => {
-  await client.query(`INSERT INTO subscription_workflows ...`);
-  await client.query(`INSERT INTO workflow_events ...`);
-});
-await enqueueImmediate({ taskType: TaskType.SEND_WELCOME_EMAIL, ... });
+DIY:
+
+```text
+transaction:
+  insert subscription_workflows row
+  insert workflow_events row
+publish SEND_WELCOME_EMAIL to RabbitMQ
 ```
 
----
+The DIY API has a database and broker dual write. A production design normally uses a transactional outbox or an equivalent repair mechanism. This repository keeps the Reconciler visible because it is educational.
 
-## Code Comparison: Durable Timer
+## Durable waiting
 
-**Temporal:**
-```typescript
-// Single line — durable, survives all crashes
-await condition(() => isCancelled, 30_000);
-// If worker crashes mid-sleep, timer resumes on restart. Zero extra code.
+Temporal:
+
+```ts
+const cancelled = await condition(() => isCancelled, 30_000);
 ```
 
-**DIY:**
-```typescript
-// Worker: set trial_end_at column
-await client.query(`
-  UPDATE subscription_workflows
-  SET trial_end_at = NOW() + INTERVAL '30 seconds'
-  WHERE id = $1
-`);
+Temporal persists the Timer. No Worker remains occupied while waiting.
 
-// Scheduler (separate process, polls every 2s):
-const expired = await query(`
-  SELECT * FROM subscription_workflows
-  WHERE state = 'WAITING_FOR_TRIAL_END'
-    AND trial_end_at <= NOW()
-`);
-for (const wf of expired.rows) {
-  await enqueueImmediate({ taskType: TaskType.CHARGE_MONTHLY_FEE, ... });
-}
+DIY:
+
+```text
+store trial_end_at in PostgreSQL
+Scheduler polls due rows
+Scheduler publishes CHARGE_MONTHLY_FEE to RabbitMQ
 ```
 
----
+If the Scheduler is unavailable, the deadline remains durable but execution begins late.
 
-## Code Comparison: Retry Policy
+## Retry scheduling
 
-**Temporal:**
-```typescript
-proxyActivities<typeof Activities>({
-  retry: {
-    maximumAttempts: 5,
-    initialInterval: '2 seconds',
-    backoffCoefficient: 2.0,
-  },
-});
-// Temporal handles all retry scheduling automatically
-```
+Temporal records attempt state and backoff durably from Activity options.
 
-**DIY:**
-```typescript
-// Worker catches failure, computes backoff, enqueues to delayed set
-} catch (err) {
-  const delayMs = Math.pow(2, attempt) * 1000;  // 2s, 4s, 8s, 16s, 32s
-  const retryTask = { ...task, attempt: attempt + 1 };
-  await enqueueDelayed(retryTask, Date.now() + delayMs);
+The DIY Worker records a failed `activity_attempts` row and inserts a `scheduled_tasks` row. The Scheduler later publishes the due task to RabbitMQ and marks the scheduled row published.
 
-  // Scheduler promotes from delayed → ready when time comes
-  await redis.zadd('diy:tasks:delayed', Date.now() + delayMs, JSON.stringify(retryTask));
-}
-```
+Publishing and marking `published_at` are not one atomic operation. A crash can therefore produce either a duplicate publication or a row that needs reconciliation. Consumers must remain idempotent.
 
----
+## Locking is not sticky execution
 
-## Code Comparison: Idempotency
+The DIY `workflow_locks` table prevents two consumers from advancing one workflow simultaneously.
 
-**Temporal:**
-```typescript
-// Temporal history guarantees this activity only runs once per workflow.
-// The only idempotency key needed is for the external API call itself.
-await chargeMonthlyFee({ customerId, workflowId });
-// If worker crashes AFTER the activity completes, replay skips it.
-```
+Temporal sticky execution is primarily a performance optimization: it routes a Workflow's next Workflow Task back to a Worker that has cached its in-memory state. Correctness does not depend on that cache. If sticky routing is unavailable, another Worker rebuilds state from History.
 
-**DIY:**
-```typescript
-// Must check idempotency manually before EVERY activity
-const key = `${workflowId}:${taskType}`;
-const existing = await query(
-  'SELECT result FROM idempotency_keys WHERE key = $1', [key]
-);
-if (existing.rows.length > 0) {
-  // Already ran — skip and return cached result
-  return;
-}
+These concepts should not be presented as equivalent.
 
-// ... execute activity ...
+## What the simplified DIY version still omits
 
-// Must INSERT idempotency key atomically with state update
-await withTransaction(async (client) => {
-  await client.query(`INSERT INTO idempotency_keys ...`);
-  await client.query(`UPDATE subscription_workflows SET state = ... `);
-});
-```
+- replicated control-plane behavior;
+- shard ownership and failover;
+- durable visibility indexing;
+- Worker Build ID and Workflow Versioning strategies;
+- namespace isolation and quotas;
+- archival and retention;
+- multi-cluster replication;
+- robust transactional outbox semantics;
+- production dead-letter and operator recovery workflows;
+- payload codecs, encryption, and data-converter compatibility;
+- exhaustive race testing.
 
----
-
-## What Temporal Eliminates
-
-| Complexity | Without Temporal | With Temporal |
-|-----------|-----------------|---------------|
-| Crash recovery | Reconciler process + expired lock detection | Built-in |
-| Timer storage | `trial_end_at` column + scheduler polling loop | Built-in (`workflow.sleep`) |
-| Idempotency tracking | `idempotency_keys` table + check before each activity | Built-in via history |
-| Retry scheduling | Delayed Redis queue + backoff math | Config in `proxyActivities` |
-| Concurrent execution prevention | `workflow_locks` table with TTL | Built-in (server serializes tasks) |
-| Activity history | `activity_attempts` table | Built-in (workflow history events) |
-| State machine | Explicit `WorkflowState` enum + `TRANSITIONS` table | Implicit in code execution point |
-| Workflow visibility | Custom query endpoints | Temporal UI + `temporal workflow list` |
-| Stuck workflow detection | Reconciler `updated_at` check | Built-in (server timeouts) |
-| Signal delivery guarantee | DB write + poll | Built-in (signals durable in history) |
-
-**Total DIY infrastructure code:** ~1500 lines across worker, scheduler, reconciler, schema
-**Total Temporal infrastructure code:** ~0 lines (it's all in the Temporal cluster)
-**Total workflow code (Temporal):** ~70 lines
-**Total equivalent workflow code (DIY):** ~250 lines in worker + state machine
+That omission is the lesson. Correct workflow execution is a platform-sized responsibility, not only a state enum plus a queue.

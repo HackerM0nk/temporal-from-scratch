@@ -8,20 +8,71 @@ Two implementations of the same subscription billing workflow:
 | Timers | `workflow.sleep(30_000)` | `trial_end_at` column + `scheduler.ts` |
 | Crash recovery | automatic | `reconciler.ts` process |
 | Retry | retry policy config | `scheduled_tasks` table + backoff math |
-| Idempotency | history replay | `idempotency_keys` table, checked before every activity |
+| Replay deduplication | completed Activity result reused from history | `idempotency_keys` table, checked before every task |
+| External side-effect safety | idempotency key or reconciliation still required | idempotency key or reconciliation still required |
 | Cancellation | `defineSignal` | HTTP POST → DB write → MQ publish |
 | Message queue | Temporal server | RabbitMQ (AMQP, message acknowledgement) |
 | Workflow state | implicit in execution history | explicit `state` VARCHAR column in PostgreSQL |
 
-The DIY version implements every guarantee the Temporal version inherits for free. It uses the same primitives — PostgreSQL, RabbitMQ, distributed locks, idempotency keys — that real production systems reach for. It just takes 15× more code.
+The DIY version approximates the guarantees used by this example with PostgreSQL, RabbitMQ, distributed locks, idempotency records, a Scheduler, and a Reconciler. It is intentionally educational, not a claim that these few files reproduce every consistency, replication, visibility, and operational guarantee of Temporal Server.
 
 ---
 
 ## How Temporal works
 
-Your workflow looks like ordinary sequential TypeScript. Under the hood, every `await` writes an event to an append-only history log. If the worker crashes, Temporal replays that history to restore execution state — completed steps are skipped, timers still fire, signals still deliver.
+Your workflow looks like ordinary sequential TypeScript. Temporal SDK operations such as scheduling an Activity, starting a Timer, or receiving a Signal add Events to an append-only history. Ordinary JavaScript `await`s do not automatically create Events. If a Worker crashes, Temporal replays history to reconstruct logical state. Completed Activity results are reused, durable Timers still fire, and recorded Signals remain available.
 
-![Temporal Architecture](docs/diagrams/temporal-architecture.png)
+See [the architecture walkthrough](docs/architecture.md) for the replay and task-delivery sequence.
+
+The phrase "resumes where it stopped" is logical, not literal. Temporal does not restore a JavaScript stack or RAM snapshot. A Worker re-executes deterministic Workflow code against recorded History until it reconstructs the same state. Completed Activity results are injected from History instead of re-running because of replay.
+
+---
+
+## From durable workflow to stateful multi-agent harness
+
+The subscription example teaches the mechanism. The included agentic example applies it to one long-lived pull-request review:
+
+```text
+GitHub event
+  -> SignalWithStart one PR Workflow
+  -> durable quiet-window debounce
+  -> immutable repository snapshot
+  -> specialist planning
+  -> parallel Flue specialist submissions
+  -> judge and stable finding IDs
+  -> final head-SHA freshness check
+  -> idempotent GitHub reconciliation
+  -> wait for the next commit
+```
+
+Temporal owns the process lifecycle: generations, Signals, Timers, fan-out, cancellation, retries, stale-publish prevention, and Continue-As-New. Flue owns one bounded agent submission: model turns, tools, skills, sandboxes, persistent agent state, and fresh-context subagents.
+
+Read [Building Stateful Multi-Agent Systems with Temporal and Flue](docs/flue-temporal-agentic-harness.md) for the end-to-end design and failure model.
+
+Run the simulated agentic workflow after starting the Temporal Worker:
+
+```bash
+# start one Workflow for the lifetime of PR 412
+npm --prefix temporal-version run agentic -- start acme/payments 412 commit-a base-a
+
+# a new commit restarts the durable quiet window and supersedes stale work
+npm --prefix temporal-version run agentic -- commit acme/payments 412 commit-b base-a
+
+# inspect deterministic Workflow state
+npm --prefix temporal-version run agentic -- status acme/payments 412
+
+# close the lifecycle
+npm --prefix temporal-version run agentic -- close acme/payments 412
+```
+
+The demo Activities simulate Flue admission and settlement. The production boundary is deliberately split into two Activities:
+
+```text
+dispatchFlueSpecialist -> persist durable receipt in Temporal History
+readFlueSpecialist(receipt) -> reattach until the admitted submission settles
+```
+
+This prevents a retry of the read side from sending a second model prompt.
 
 ---
 
@@ -29,7 +80,7 @@ Your workflow looks like ordinary sequential TypeScript. Under the hood, every `
 
 The DIY version makes the hidden machinery explicit: four processes, six PostgreSQL tables, one RabbitMQ queue, and five failure modes to handle at every step.
 
-![DIY Architecture](docs/diagrams/diy-architecture.png)
+See [the DIY architecture](docs/diy-architecture.md) for the state machine, queue, scheduler, locks, and repair loop.
 
 ---
 
@@ -211,23 +262,26 @@ psql postgresql://postgres:postgres@localhost:5432/diy_workflows \
 
 ## Failure scenarios
 
+> **Simulation boundary:** the example Activities log stable idempotency keys but do not include a real email or payment provider with a durable deduplication ledger. The code therefore teaches where the key must cross the boundary; it does not by itself prove that an external effect happened once. A production integration must have the provider enforce the key or must reconcile desired state after retry.
+
 | Scenario | Temporal | DIY |
 |---|---|---|
-| Worker crashes after email sends | History records completion. Restart: replay skips the activity — email not re-sent. | RabbitMQ redelivers (unacked). Idempotency key blocks re-execution. |
+| Worker crashes after completion is recorded | Replay reuses the result; the Activity is not scheduled again. | RabbitMQ may redeliver; the idempotency record skips completed work. |
+| Worker crashes after an external send but before completion is recorded | Activity may execute again; the email provider must deduplicate a stable key. | Task may execute again; the email provider must deduplicate a stable key. |
 | Worker crashes mid-sleep | Timer is server-side. Crash has no effect — it fires regardless. | `trial_end_at` is in PostgreSQL. Scheduler is a separate process, keeps running. |
 | Charge fails, retry with backoff | Automatic — configured in `proxyActivities`. | Worker INSERTs into `scheduled_tasks` with `execute_after = now + 2^n s`. Scheduler promotes when due. |
-| Same task delivered twice | Temporal deduplicates at the server level. | `idempotency_keys` table — `INSERT ON CONFLICT DO NOTHING` before every execution. |
+| Same logical request arrives twice | Workflow IDs, request IDs, and application event IDs cover different duplicate classes; there is no blanket deduplication guarantee. | Stable task IDs plus `idempotency_keys`; external effects still need their own keys. |
 | Cancel during trial wait | Signal written to history, delivered on next workflow task. | HTTP POST updates `state = CANCELLATION_REQUESTED`, enqueues cancel task immediately. |
-| DB committed, MQ publish fails | Not possible — task queue and state are the same system. | Reconciler: finds `state = CHARGED`, no pending task → INSERTs into `scheduled_tasks`. |
-| Worker crashes holding lock | Server detects missed heartbeat, reassigns. | Reconciler: `DELETE FROM workflow_locks WHERE expires_at < NOW()`, then re-enqueues. |
+| Orchestrator state advances but next task is not durably scheduled | Temporal commits its internal state transition and Commands through the service protocol; application code does not perform a separate DB-write-plus-broker-publish pair. | Reconciler: finds `state = CHARGED`, no pending task → INSERTs into `scheduled_tasks`. |
+| Worker crashes during work | Workflow Tasks recover through Task timeout/replay; Activities recover through Start-to-Close or Heartbeat timeout. | RabbitMQ redelivers unacknowledged work; expired locks and the reconciler repair drift. |
 
 ---
 
 ## Why not Kafka? Why not Airflow?
 
-**Kafka** is a distributed log for high-throughput event streaming. It's the wrong primitive for task queuing: no native delayed messages, consumer offset tracking adds state you'd manage yourself, and fan-out semantics conflict with "each task consumed exactly once." RabbitMQ's AMQP semantics — durable queues, per-message acknowledgement, consumer prefetch — are the right fit.
+**Kafka** is a distributed log optimized for ordered event streams and replayable consumer offsets. It can back work-processing systems, but delayed retries, per-item acknowledgement, and competing-consumer task semantics require additional design. This demo uses RabbitMQ because durable queues, manual acknowledgement, and consumer prefetch make the DIY task-delivery mechanism easier to see. Neither broker makes external side effects exactly once.
 
-**Airflow** is a workflow scheduler for batch data pipelines. It schedules DAG runs on a cron schedule. It cannot express "wait indefinitely for this specific customer to cancel, then branch" — DAGs are static structures with no per-instance signal delivery and no support for long-running per-entity workflows at scale. The correct comparison class for Temporal is [Netflix Conductor](https://github.com/Netflix/conductor), [AWS Step Functions](https://aws.amazon.com/step-functions/), and [Azure Durable Functions](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-overview).
+**Airflow** is primarily a batch data-pipeline orchestrator. Sensors and deferrable operators can wait efficiently, but Airflow's DAG-run/task-instance model is different from a message-driven, per-entity application process that receives Signals and Queries over months. Evaluate the semantics you need instead of treating either product as a drop-in replacement. Closer managed-orchestration comparisons include [Netflix Conductor](https://github.com/Netflix/conductor), [AWS Step Functions](https://aws.amazon.com/step-functions/), and [Azure Durable Functions](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-overview).
 
 ---
 
@@ -236,8 +290,10 @@ psql postgresql://postgres:postgres@localhost:5432/diy_workflows \
 ```
 temporal-version/src/
   workflows/subscriptionWorkflow.ts    the whole durable workflow — ~100 lines
+  workflows/agenticReviewWorkflow.ts   long-lived PR lifecycle + specialist fan-out
   activities/subscriptionActivities.ts
-  worker.ts / api.ts / cli.ts
+  activities/agenticReviewActivities.ts Flue dispatch/read boundary + publish guard
+  worker.ts / api.ts / cli.ts / agenticCli.ts
 
 diy-version/src/
   db/schema.sql                        6 tables — start here
@@ -256,6 +312,7 @@ docs/
   architecture.md      sequence diagrams for both versions
   comparison.md        concept mapping table
   failure-scenarios.md 7 failure modes analysed
+  flue-temporal-agentic-harness.md end-to-end multi-agent architecture
 ```
 
 ---

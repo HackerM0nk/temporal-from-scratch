@@ -144,10 +144,13 @@ export async function startConsumer(handler: TaskHandler): Promise<void> {
 
 // ── Queue stats ───────────────────────────────────────────────────────────────
 
-export async function queueDepth(): Promise<{ ready: number; unacked: number }> {
+export async function queueDepth(): Promise<{ ready: number; consumers: number }> {
   const channel = await getChannel();
   const info = await channel.checkQueue(TASK_QUEUE);
-  return { ready: info.messageCount, unacked: info.consumerCount };
+  // RabbitMQ's checkQueue reports ready messages and consumer count. It does
+  // not report the number of unacknowledged deliveries. Labeling
+  // consumerCount as "unacked" teaches the wrong operational signal.
+  return { ready: info.messageCount, consumers: info.consumerCount };
 }
 
 export async function closeRabbitMQ(): Promise<void> {

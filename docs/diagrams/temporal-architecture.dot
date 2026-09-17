@@ -6,7 +6,7 @@ digraph {
   nodesep=0.7
   ranksep=0.9
   pad=0.5
-  label="Temporal — Durable Execution Engine\nEvery await is crash-proof. Timers, retries, and signals are handled by the server — not by your worker."
+  label="Temporal — Durable Execution Engine\nWorkflow progress is reconstructed from durable history. Timers, retries, and signals are coordinated by the service."
   labelloc=b labeljust=c fontsize=11 fontcolor="#64748B"
 
   node [fontname="Helvetica" style=filled fontsize=11 margin="0.2,0.12"]
@@ -40,10 +40,10 @@ digraph {
     label="Temporal Worker  —  your Node.js process  (stateless)" fontsize=12 fontname="Helvetica Bold" fontcolor="white"
     bgcolor="#1E293B" color="#374151" style=rounded penwidth=1.5
 
-    sandbox [label="Workflow Sandbox  (V8 Isolate)\n────────────────────────────\nDeterministic replay of workflow history.\nCompleted activities are skipped — not re-executed.\nWorker crash = resume from last history event."
+    sandbox [label="Workflow Sandbox  (V8 Isolate)\n────────────────────────────\nDeterministic replay of workflow history.\nRecorded activity results are reused on replay.\nWorker crash = resume from durable history."
              shape=box fillcolor="#5B21B6" fontcolor="white" width=3.2 fontsize=10]
 
-    exec    [label="Activity Executor  (Node.js)\n────────────────────────────\nReal I/O: email service, Stripe, databases.\nSends idempotency keys to external APIs.\nRetried automatically by server on failure."
+    exec    [label="Activity Executor  (Node.js)\n────────────────────────────\nReal I/O: email service, Stripe, databases.\nSends idempotency keys to external APIs.\nAn activity may execute more than once."
              shape=box fillcolor="#15803D" fontcolor="white" width=3.2 fontsize=10]
 
     { rank=same; sandbox; exec }
