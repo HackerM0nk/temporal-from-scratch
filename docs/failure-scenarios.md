@@ -1,228 +1,110 @@
-# Failure Scenarios
+# Failure Scenarios and the Exact Guarantees
 
-## How to Run Each Scenario
+The useful question is never only "does it retry?" Ask:
 
-Each scenario has a corresponding script in `scripts/failure-scenarios/`.
-All commands assume you are in the repo root with infrastructure running.
+1. What durable evidence exists?
+2. What operation may execute again?
+3. What external effect needs idempotency?
+4. Which component detects the failure?
 
----
+## 1. Workflow Worker dies after an Activity completed
 
-## Scenario 1: Worker Crashes After Email Send
+If Temporal already recorded `ActivityTaskCompleted`, another Workflow Worker replays History and receives the recorded result. Replay does not schedule the Activity again.
 
-**Setup:** Start a workflow, kill the worker immediately after `sendWelcomeEmail` completes but before state is fully persisted.
+If the Activity performed the external effect but its Worker died before reporting completion, Temporal has no completion Event. The Activity can execute again after its Start-to-Close or Heartbeat timeout. The email or payment API must deduplicate a stable operation key.
 
-### What Happens in Temporal
+In the DIY system, RabbitMQ redelivers an unacknowledged message. If the database idempotency record exists, the consumer skips the completed task. If the external effect happened before that record committed, the external provider must deduplicate the same key.
 
-1. Worker executes `sendWelcomeEmail` activity
-2. Temporal records `ActivityTaskCompleted(sendWelcomeEmail)` in history
-3. Worker crashes (Ctrl+C)
-4. Temporal detects heartbeat loss → reschedules the **workflow task** (not the activity)
-5. New worker picks up workflow task, REPLAYS history
-6. Replay sees `ActivityTaskCompleted(sendWelcomeEmail)` → skips the actual call, injects result
-7. Replay advances to `sleep(30s)` → creates `TimerStarted` command
-8. Execution resumes seamlessly — `sendWelcomeEmail` was NOT called twice
+## 2. All application Workers are down during a Timer
 
-**Which component recovers:** Temporal Server (task timeout + reassignment)
-**History records created:** `WorkflowTaskFailed` (if crash mid-task), then new `WorkflowTaskCompleted`
-**Why idempotency still required:** The email HTTP request may have been sent but the worker crashed before Temporal recorded `ActivityTaskCompleted`. On retry (attempt 2), the email service needs an idempotency key to avoid a duplicate send.
+Temporal stores the Timer in the Service. It fires without an application Worker. A Workflow Task waits until a compatible Worker returns.
 
-### What Happens in DIY
+The DIY system stores `trial_end_at` in PostgreSQL. The Scheduler must be alive to discover that it is due and publish the next RabbitMQ task. If the Scheduler is down, execution is late but the deadline is not forgotten.
 
-1. Worker executes `sendWelcomeEmail`
-2. Worker begins DB transaction: insert idempotency key + update state + insert event
-3. **Case A: Crash before COMMIT** — transaction rolls back. State unchanged. No idempotency key. Redis task is gone (BLPOP already dequeued it). Reconciler detects `WELCOME_EMAIL_SCHEDULED` state + no lock + `updated_at` is old → re-enqueues. Worker re-executes `sendWelcomeEmail`. Idempotency key sent to email service prevents duplicate.
-4. **Case B: Crash after COMMIT but before enqueue** — state is `WAITING_FOR_TRIAL_END`, `trial_end_at` is set. No next task in Redis. Scheduler detects `trial_end_at` eventually and fires the charge task. No data loss.
+## 3. An Activity fails twice and then succeeds
 
-**Which component recovers:** Reconciler (Case A) or Scheduler (Case B)
-**State/history records created:** `RECONCILER_REQUEUED` event in `workflow_events`
-**Why idempotency still required:** Activity may have sent the email before the transaction — retry needs the idempotency key to avoid duplicates.
+Temporal records the failed attempts and durable retry backoff. Workflow code remains suspended on the Activity call until it succeeds or exhausts policy.
 
----
+The DIY Worker records each attempt and inserts a future `scheduled_tasks` row. The Scheduler publishes it when due. Publishing can be duplicated around a crash, so the consumer remains idempotent.
 
-## Scenario 2: Worker Crashes During Trial Wait
+## 4. The same logical request arrives twice
 
-**Setup:** Start a workflow, let welcome email send, then kill the worker. The workflow should be sleeping.
+There is no single blanket "Temporal deduplicates everything" guarantee.
 
-### What Happens in Temporal
+- A stable Workflow ID controls duplicate Workflow starts according to the Workflow ID reuse/conflict policy.
+- Retried client requests use request IDs for transport-level deduplication.
+- Two independently sent but logically identical Signals may both be accepted; include an application event ID and deduplicate in Workflow state when needed.
+- Updates have Update IDs and server-side deduplication within a Workflow Run.
+- Activity retries can execute Activity code more than once.
 
-1. Workflow issues `TimerStarted` command
-2. Timer is stored server-side — **completely independent of the worker**
-3. Worker crashes
-4. Timer fires after 30 seconds
-5. Worker restarts (or another worker picks up)
-6. Worker gets workflow task with `TimerFired` event in history
-7. Workflow replays past sleep, continues to `chargeMonthlyFee`
-8. Zero impact — the timer was never in the worker's memory
+The DIY system likewise needs stable workflow, task, message, and external-operation identifiers for different boundaries.
 
-**Which component recovers:** Temporal Server (self-sufficient)
-**History records created:** `TimerFired` event
+## 5. Cancellation races the trial deadline
 
-### What Happens in DIY
+Temporal records both the Signal and Timer Events in a total order for the Workflow. Workflow code observes that order and takes a deterministic branch. Cancellation of already-running Activities remains cooperative.
 
-1. `trial_end_at` is set in the DB — not in the worker process memory
-2. Worker crashes (or is killed)
-3. Scheduler continues polling independently (different process)
-4. After 30 seconds, Scheduler finds `WAITING_FOR_TRIAL_END` with `trial_end_at < NOW()`
-5. Scheduler enqueues `CHARGE_MONTHLY_FEE` task
-6. Any worker (new or restarted) picks it up and continues
+The DIY API and Scheduler race through PostgreSQL state transitions. Correctness depends on conditional updates such as `UPDATE ... WHERE state = 'WAITING_FOR_TRIAL_END'`, plus task-time state validation.
 
-**Which component recovers:** Scheduler (timer is in DB, not in worker memory)
-**State/history records created:** `TIMER_FIRED` event, `CHARGE_SCHEDULED` state
-**Why idempotency still required:** Scheduler could run twice before the state update is visible — `UPDATE WHERE state = 'WAITING_FOR_TRIAL_END'` with optimistic locking prevents double-scheduling.
+## 6. Database commit succeeds and RabbitMQ publish fails
 
----
+The DIY Worker has a dual-write boundary:
 
-## Scenario 3: Charge Activity Fails Twice Then Succeeds
-
-**Setup:** Set `SIMULATE_CHARGE_FAILURE=true` before starting the worker.
-
-### What Happens in Temporal
-
-1. `chargeMonthlyFee` activity scheduled (attempt 1)
-2. Worker throws error → Temporal records `ActivityTaskFailed`
-3. Temporal waits `initialInterval` (2s), schedules retry (attempt 2)
-4. Attempt 2 fails → wait 4s
-5. Attempt 3 succeeds
-6. Temporal records `ActivityTaskCompleted`, workflow advances
-7. **The workflow code never saw the failures** — it just `await`ed the result
-
-**Which component recovers:** Temporal Server (retry scheduler)
-**History records:** `ActivityTaskScheduled`, `ActivityTaskFailed` ×2, `ActivityTaskCompleted`
-
-### What Happens in DIY
-
-1. Worker picks up `CHARGE_MONTHLY_FEE` task (attempt 1)
-2. Activity throws → worker calls `handleActivityFailure`
-3. Worker inserts `activity_attempts` record with status=FAILED
-4. Worker calls `enqueueDelayed(task, now + 2000)` — ZADD to Redis sorted set with score = `now + 2s`
-5. Scheduler promotes delayed task after 2s → RPUSH to ready queue
-6. Worker picks up (attempt 2) → fails → `enqueueDelayed(now + 4s)`
-7. Worker picks up (attempt 3) → succeeds
-8. Idempotency key written, state transitions to `CHARGED`
-
-**Which component recovers:** Worker (enqueues delayed retry) + Scheduler (promotes delayed tasks)
-**DB records created:** 3 rows in `activity_attempts`, 3 `TASK_FAILED`/`TASK_COMPLETED` events
-**Why idempotency still required:** If attempt 2 crashes after calling Stripe but before recording success, attempt 3 would re-call Stripe — same idempotency key prevents double charge.
-
----
-
-## Scenario 4: Duplicate Task Delivery
-
-**Setup:** Manually RPUSH the same task JSON to `diy:tasks:ready` twice (simulating Redis at-least-once delivery), or send the same start request twice to the Temporal version.
-
-### What Happens in Temporal
-
-Starting the same `workflowId` twice: `WorkflowExecutionAlreadyStartedError` on the second call.
-Same signal twice: handler fires twice. The `isCancelled` flag is set to `true` both times — idempotent (setting a bool twice is safe).
-Same activity task (impossible from outside — Temporal deduplicates at server): history prevents replay.
-
-### What Happens in DIY
-
-1. Two `CHARGE_MONTHLY_FEE` tasks in Redis queue
-2. Worker 1 picks up task A → acquires lock → checks idempotency key (not found) → executes charge → writes idempotency key → releases lock
-3. Worker 2 picks up task B → tries to acquire lock → **lock held by Worker 1** → re-queues with delay
-4. After Worker 1 releases lock: Worker 2 acquires lock → checks idempotency key → **FOUND** → skips execution
-5. Customer is only charged once ✓
-
-**Idempotency table prevents the duplicate.** Without it, both workers could execute `chargeMonthlyFee` if they happened to run simultaneously (lock expired between check and acquire).
-
----
-
-## Scenario 5: Customer Cancels During Trial Wait
-
-**Setup:** Start workflow, wait for welcome email, then immediately cancel.
-
-### What Happens in Temporal
-
-1. Workflow is suspended at `condition(() => isCancelled, TRIAL_PERIOD_MS)`
-2. `cancelSubscription` signal arrives → `isCancelled = true`
-3. `condition()` returns `true` (condition met before timeout)
-4. Workflow branches to cancellation path: `processSubscriptionCancellation` + `sendSorryToSeeYouGoEmail`
-5. Timer is automatically cancelled (never fires)
-
-**Which component handles:** Temporal Server (signal delivery) + Workflow code (conditional branch)
-
-### What Happens in DIY
-
-1. Workflow is in `WAITING_FOR_TRIAL_END` state, sleeping
-2. Cancel API call: UPDATE state → `CANCELLATION_REQUESTED`, set `cancellation_reason`
-3. RPUSH `PROCESS_CANCELLATION` task to Redis
-4. Worker picks up cancellation task → executes `processSubscriptionCancellation` + `sendSorryToSeeYouGoEmail`
-5. Scheduler checks for `WAITING_FOR_TRIAL_END` — workflow is no longer in that state → **scheduler does nothing** (the optimistic UPDATE would affect 0 rows)
-6. `trial_end_at` is effectively ignored — cancellation wins
-
-**Which component handles:** API (signal equivalent) + Worker (cancellation activities)
-**Race condition:** If the Scheduler fires the charge task at the exact same time as the cancel API runs:
-- Scheduler does `UPDATE WHERE state = 'WAITING_FOR_TRIAL_END'` → 0 rows updated (already changed to `CANCELLATION_REQUESTED`)
-- Worker picks up charge task → checks state → `CANCELLATION_REQUESTED` is in `TERMINAL_STATES` effectively → would need explicit check. In our code we check `TERMINAL_STATES` which doesn't include `CANCELLATION_REQUESTED`, so worker acquires lock, sees state is `CANCELLATION_REQUESTED` → discards the charge task (state mismatch with expected transition).
-
----
-
-## Scenario 6: Database Updated but Queue Publish Fails
-
-**Setup:** Simulate a Redis crash between the DB commit and the RPUSH.
-
-### What Happens in Temporal
-
-**This scenario cannot happen.** Temporal's task queue and workflow state storage are both managed by the Temporal Server in the same transactional context. Publishing the next workflow task is atomic with the state update.
-
-### What Happens in DIY
-
-1. Worker commits DB transaction (idempotency key + state = CHARGED)
-2. Redis RPUSH fails (connection lost, Redis restarted, etc.)
-3. Worker crashes or continues without the RPUSH succeeding
-4. Workflow is stuck in `CHARGED` state with no task in the queue
-
-**Recovery — Reconciler:**
-1. Reconciler runs every 10s
-2. Finds workflow in state `CHARGED` with `updated_at > 60s ago` and no active lock
-3. `CHARGED` maps to `TaskType.SEND_END_OF_TRIAL_EMAIL` in `STATE_TO_PENDING_TASK`
-4. Reconciler checks idempotency — `SEND_END_OF_TRIAL_EMAIL` not yet done
-5. Reconciler re-enqueues `SEND_END_OF_TRIAL_EMAIL` task
-
-**This is the most important scenario for DIY systems.** It demonstrates why you need a reconciler: you cannot atomically update a database AND publish to a message queue in a single transaction (two-phase commit is impractical). The reconciler is the compensating mechanism.
-
-**State/history created:** `RECONCILER_REQUEUED` event
-
----
-
-## Scenario 7: Stuck Workflow Repaired by Reconciliation
-
-**Setup:** Kill the DIY worker while it holds a lock (e.g., in the middle of `chargeMonthlyFee`).
-
-**Steps to observe:**
-```bash
-# 1. Start a workflow
-npx ts-node diy-version/src/cli.ts start customer-789
-
-# 2. Watch worker logs — wait for "Calling payment processor"
-# 3. Kill the worker immediately
-pkill -f "ts-node src/worker.ts"
-
-# 4. Check state — should be CHARGING with a lock
-psql $DATABASE_URL -c "SELECT state, updated_at FROM subscription_workflows WHERE customer_id='customer-789';"
-psql $DATABASE_URL -c "SELECT * FROM workflow_locks;"
-
-# 5. Wait 30 seconds (lock expires) + 10 seconds (reconciler runs)
-# 6. Check again — should be CHARGING → lock gone, new task in queue
-# 7. Restart worker — it picks up the task and continues
+```text
+commit state in PostgreSQL
+publish next task to RabbitMQ
 ```
 
-### What the Reconciler Does
+A crash between those operations leaves durable state with no queued task. The repository's Reconciler repairs the drift. A stronger production pattern is a transactional outbox: write state and an outbox row in one database transaction, then let a relay publish and mark the outbox row delivered.
 
+Within Temporal, Workflow mutable state and creation of its internal Tasks are managed by the Temporal Service. This removes that application-level database/broker dual write. External systems called by Activities still create their own distributed transaction boundaries.
+
+## 7. Worker dies while holding the DIY lock
+
+RabbitMQ detects the closed consumer connection and redelivers the unacknowledged message. The next Worker may still be blocked by the PostgreSQL lock row until it expires. The Reconciler removes expired locks and repairs state/queue drift.
+
+Temporal Workflow correctness does not depend on an application lock row. Workflow Tasks for one Workflow Execution are serialized by the Service. Sticky execution may cache state on a Worker, but the cache is optional; another Worker can replay History.
+
+## 8. A new PR commit arrives while agents review an old commit
+
+The PR Workflow records the new-commit Signal and updates `latestHeadSha`. It cancels or abandons unfinished old-generation work, records that generation as `SUPERSEDED`, and begins a new quiet window.
+
+Completed old-generation results remain useful for audit and evals but cannot publish. Immediately before publication, an Activity fetches the current GitHub head SHA. The publish Activity also performs a conditional freshness check to close the check-to-use race.
+
+## 9. Flue admits a specialist submission and the Temporal Activity dies
+
+Split integration into two Activities:
+
+```text
+dispatch -> receipt
+read(receipt) -> terminal result
 ```
-[reconciler] 🔓 Released 1 expired lock(s):
-[reconciler]    workflowId=<uuid> was locked by worker-12345-abc
 
-[reconciler] 🔧 Found 1 stuck workflow(s)
-[reconciler] ↺ Re-enqueued task | workflowId=<uuid> | state=CHARGING | task=CHARGE_MONTHLY_FEE
-```
+After Temporal records the receipt, retries of `read` reattach to the same Flue submission. The remaining crash window is inside dispatch: Flue may admit the prompt before the Activity returns its receipt. Use a stable create-only conversation/submission identity derived from review generation and specialist so retry resolves or rejects the duplicate instead of silently doing the work twice.
 
-### Why the Charge is Not Duplicated
+## 10. Flue crashes during an agent tool call
 
-When the worker re-executes `chargeMonthlyFee`:
-1. It checks `idempotency_keys` for `{workflowId}:CHARGE_MONTHLY_FEE`
-2. If the charge succeeded before the crash: key exists → skips execution, returns cached result
-3. If the charge was in-flight when crash happened: key absent → re-calls Stripe with same idempotency key → Stripe returns original charge result
+Flue recovery uses durable conversation evidence:
 
-The combination of **idempotency_keys table** (workflow-level) + **idempotency key on Stripe** (API-level) guarantees at-most-once charging.
+- recorded tool results are reused;
+- unresolved ordinary tool calls become explicit unknown-outcome results rather than being blindly repeated;
+- delegated tasks reattach to their own transcripts;
+- a `durable: true` tool replays completed `step.do` checkpoints and resumes unfinished work.
+
+`step.do` is still exactly-once-recorded and at-least-once-executed. External side effects inside a step require idempotency.
+
+## Failure-injection checklist
+
+Automate tests that kill a process at each named boundary:
+
+- before Activity dispatch;
+- after external effect but before Activity completion;
+- after Activity completion but before the next Workflow Task;
+- during durable Timer wait;
+- after Flue admission but before receipt persistence;
+- during Flue read;
+- during specialist fan-out;
+- after stale-head check but before publish;
+- after one GitHub comment but before publish Activity completion;
+- immediately before Continue-As-New.
+
+For every test, assert external effects, Workflow History, current state, retries, and terminal classification.

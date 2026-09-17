@@ -37,6 +37,9 @@ function log(activity: string, customerId: string, msg: string, data?: object) {
 
 // ── Simulated external call ───────────────────────────────────────────────────
 // Pretends to call an email service, payment processor, etc.
+// The demo logs idempotency keys but has no durable provider-side ledger.
+// Production correctness requires the external provider to enforce the key or
+// an application reconciliation loop to converge retries on one desired state.
 async function simulateExternalCall(ms: number, service: string): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }

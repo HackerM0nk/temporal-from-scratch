@@ -18,7 +18,7 @@ sequenceDiagram
     Worker->>TemporalServer: PollForWorkflowTask
     TemporalServer-->>Worker: WorkflowTask (run workflow code)
 
-    Note over Worker: Executes workflow code up to first await<br/>Produces "commands": [ScheduleActivity(sendWelcomeEmail)]
+    Note over Worker: Executes until blocked on a Temporal operation<br/>Produces Command: ScheduleActivity(sendWelcomeEmail)
 
     Worker->>TemporalServer: RespondWorkflowTaskCompleted(commands)
     TemporalServer->>History: Append ActivityTaskScheduled(sendWelcomeEmail)
@@ -68,7 +68,7 @@ sequenceDiagram
 
     Note over Worker1: 💥 CRASH
 
-    Note over TemporalServer: Activity heartbeat timeout (startToCloseTimeout)<br/>After timeout: reschedule activity task
+    Note over TemporalServer: Start-to-Close timeout expires<br/>A Heartbeat timeout could detect loss earlier for a heartbeating Activity
 
     Worker2->>TemporalServer: PollForActivityTask
     TemporalServer-->>Worker2: ActivityTask(chargeMonthlyFee, attempt=2)
@@ -111,8 +111,9 @@ sequenceDiagram
 | Problem | Temporal's Solution |
 |---------|---------------------|
 | Worker crash mid-activity | Reschedule after startToCloseTimeout |
-| Worker crash during sleep | Timer stored server-side, fires when worker returns |
-| Duplicate activity execution | History records completion; replay skips completed activities |
+| Worker crash during sleep | Timer is server-side and fires without an application Worker; continuation waits for a Worker |
+| Workflow replay reaches completed Activity | Recorded result is injected; replay does not schedule it again |
+| Activity effect happens before completion is recorded | Activity may execute again; external effect needs idempotency |
 | Signal delivery to sleeping workflow | Signals stored in history; delivered on next workflow task |
 | Concurrent workflow execution | Server assigns each workflow task to exactly one worker |
 | Retry with backoff | Configured in `proxyActivities` retry policy |

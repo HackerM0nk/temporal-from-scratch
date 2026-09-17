@@ -8,16 +8,16 @@
 //   4. Executing activity code in normal Node.js
 //
 // KEY CONCEPT — Worker crash:
-//   If this process dies, Temporal detects the missed heartbeat and reassigns
-//   in-progress tasks to another worker. No workflow state is lost because
-//   all state lives in Temporal's database, not in this process's memory.
+//   If this process dies, Workflow Tasks become available to another Worker.
+//   Activity loss is detected by its Start-to-Close or Heartbeat timeout.
+//   No authoritative workflow state lives only in this process's memory.
 //
 // Try it: start a subscription, then kill this process (Ctrl+C), then restart.
 // The workflow will resume from exactly where it left off.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Worker, NativeConnection } from '@temporalio/worker';
-import * as activities from './activities/subscriptionActivities';
+import * as activities from './activities';
 import path from 'path';
 
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS ?? 'localhost:7233';
@@ -59,7 +59,7 @@ async function main() {
     // the exact path. Detect ts-node vs compiled runtime by checking __filename.
     workflowsPath: path.resolve(
       __dirname,
-      `./workflows/subscriptionWorkflow${__filename.endsWith('.ts') ? '.ts' : '.js'}`,
+      `./workflows/index${__filename.endsWith('.ts') ? '.ts' : '.js'}`,
     ),
 
     // Activities run in normal Node.js — just pass the module object.

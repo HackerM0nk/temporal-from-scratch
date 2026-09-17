@@ -1,168 +1,73 @@
-# DIY Architecture
+# DIY Orchestrator Architecture
 
-## System Overview
-
-```mermaid
-graph TD
-    CLI[CLI / HTTP API] -->|POST /workflows/subscription| API[API Server :3001]
-    API -->|INSERT subscription_workflows| PG[(PostgreSQL)]
-    API -->|RPUSH diy:tasks:ready| Redis[(Redis)]
-
-    Worker[Worker Process] -->|BLPOP diy:tasks:ready| Redis
-    Worker -->|SELECT, INSERT, UPDATE| PG
-    Worker -->|Calls activities| Activity[Activity Functions]
-    Activity -->|Simulated: email, charge| External[External Services]
-
-    Scheduler[Scheduler Process] -->|SELECT trial_end_at < NOW| PG
-    Scheduler -->|RPUSH diy:tasks:ready| Redis
-    Scheduler -->|ZRANGEBYSCORE| Redis
-
-    Reconciler[Reconciler Process] -->|SELECT stuck workflows| PG
-    Reconciler -->|DELETE expired locks| PG
-    Reconciler -->|RPUSH| Redis
-```
-
-## State Machine
+The DIY implementation uses PostgreSQL for authoritative workflow state and delayed tasks, plus RabbitMQ for ready-task delivery.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> STARTED : API creates workflow
-
-    STARTED --> WELCOME_EMAIL_SCHEDULED : first task enqueued
-    WELCOME_EMAIL_SCHEDULED --> WELCOME_EMAIL_SENT : worker executes sendWelcomeEmail
-
-    WELCOME_EMAIL_SENT --> WAITING_FOR_TRIAL_END : trial_end_at set (=NOW+30s)
-
-    WAITING_FOR_TRIAL_END --> CHARGE_SCHEDULED : scheduler detects trial_end_at passed
-    CHARGE_SCHEDULED --> CHARGING : worker starts chargeMonthlyFee
-    CHARGING --> CHARGED : charge succeeds
-    CHARGED --> END_OF_TRIAL_EMAIL_SENT : sendEndOfTrialEmail
-    END_OF_TRIAL_EMAIL_SENT --> COMPLETED : sendMonthlyChargeEmail
-
-    WAITING_FOR_TRIAL_END --> CANCELLATION_REQUESTED : cancel API called
-    WELCOME_EMAIL_SENT --> CANCELLATION_REQUESTED : cancel API called
-    CHARGING --> CANCELLATION_REQUESTED : cancel API called (best-effort)
-
-    CANCELLATION_REQUESTED --> CANCELLING : worker starts processSubscriptionCancellation
-    CANCELLING --> CANCELLED : sendSorryToSeeYouGoEmail complete
-
-    CHARGING --> FAILED : max retries exhausted
-    CANCELLING --> FAILED : max retries exhausted
+flowchart TD
+    Client --> API
+    API -->|workflow row and event| PG[(PostgreSQL)]
+    API -->|publish ready task| MQ[(RabbitMQ)]
+    MQ -->|manual-ack delivery| Worker
+    Worker -->|lock, attempt, state, event, idempotency| PG
+    Worker -->|publish next ready task| MQ
+    Scheduler -->|claim due scheduled_tasks| PG
+    Scheduler -->|publish| MQ
+    Reconciler -->|repair expired locks and drift| PG
+    Reconciler -->|schedule repair task| PG
 ```
 
-## Full Request Flow
+## PostgreSQL tables
 
-```mermaid
-sequenceDiagram
-    participant CLI
-    participant API
-    participant PG as PostgreSQL
-    participant Redis
-    participant Worker
-    participant Scheduler
+| Table | Purpose |
+|---|---|
+| `subscription_workflows` | Authoritative current state and timer deadline |
+| `workflow_events` | Append-only audit log; unlike Temporal History, not used for replay |
+| `activity_attempts` | Attempt status and results |
+| `idempotency_keys` | Completed-task result cache |
+| `workflow_locks` | One consumer advancing a workflow at a time |
+| `scheduled_tasks` | Durable delayed retries and repair publications |
+| `dead_letter_tasks` | Exhausted work requiring operator action |
 
-    CLI->>API: POST /workflows/subscription { customerId: "customer-456" }
+## Normal task execution
 
-    API->>PG: BEGIN
-    API->>PG: INSERT subscription_workflows (state=WELCOME_EMAIL_SCHEDULED)
-    API->>PG: INSERT workflow_events (WORKFLOW_STARTED)
-    API->>PG: COMMIT
-    API->>Redis: RPUSH diy:tasks:ready { taskType: SEND_WELCOME_EMAIL }
-    API-->>CLI: 201 { workflowId, state: WELCOME_EMAIL_SCHEDULED }
-
-    Worker->>Redis: BLPOP diy:tasks:ready
-    Redis-->>Worker: { taskType: SEND_WELCOME_EMAIL, workflowId }
-
-    Worker->>PG: INSERT workflow_locks (acquire lock)
-    Worker->>PG: SELECT idempotency_keys WHERE key = "wf-id:SEND_WELCOME_EMAIL"
-    Note over Worker: Not found → proceed
-
-    Worker->>Worker: sendWelcomeEmail() ← actual side effect happens here
-
-    Worker->>PG: BEGIN
-    Worker->>PG: INSERT idempotency_keys
-    Worker->>PG: UPDATE subscription_workflows SET state=WELCOME_EMAIL_SENT
-    Worker->>PG: UPDATE subscription_workflows SET state=WAITING_FOR_TRIAL_END, trial_end_at=+30s
-    Worker->>PG: INSERT activity_attempts (COMPLETED)
-    Worker->>PG: INSERT workflow_events (TASK_COMPLETED, TIMER_STARTED)
-    Worker->>PG: COMMIT
-
-    Worker->>PG: DELETE workflow_locks (release)
-    Note over Worker: No next task enqueued — scheduler handles the timer
-
-    Note over Scheduler: 30 seconds pass...
-
-    Scheduler->>PG: SELECT * WHERE state=WAITING_FOR_TRIAL_END AND trial_end_at <= NOW()
-    Scheduler->>PG: UPDATE state=CHARGE_SCHEDULED WHERE state=WAITING_FOR_TRIAL_END
-    Scheduler->>Redis: RPUSH { taskType: CHARGE_MONTHLY_FEE }
-
-    Worker->>Redis: BLPOP → { taskType: CHARGE_MONTHLY_FEE }
-    Note over Worker: Acquire lock → check idempotency → execute charge → commit → release
-
-    Note over Worker: ... continues through END_OF_TRIAL_EMAIL_SENT → COMPLETED
+```text
+RabbitMQ delivers message without removing it
+  -> Worker acquires PostgreSQL workflow lock
+  -> Worker validates current state
+  -> Worker checks idempotency record
+  -> Worker records RUNNING attempt
+  -> Worker executes external operation
+  -> transaction records result, state transition, event, idempotency record
+  -> Worker publishes next task
+  -> Worker acknowledges current RabbitMQ message
 ```
 
-## Failure Recovery Flow
+RabbitMQ acknowledgement protects against consumer loss, but it does not make external effects exactly once. A Worker can perform an effect and die before the idempotency record commits.
 
-```mermaid
-sequenceDiagram
-    participant Worker
-    participant PG as PostgreSQL
-    participant Redis
-    participant Reconciler
+## Delayed retries
 
-    Worker->>Redis: BLPOP → { taskType: CHARGE_MONTHLY_FEE }
-    Worker->>PG: INSERT workflow_locks
-    Worker->>Worker: chargeMonthlyFee() — activity starts
+RabbitMQ carries ready work. PostgreSQL carries future work:
 
-    Note over Worker: 💥 CRASH — lock still in DB, activity incomplete
-
-    Note over Reconciler: 30 seconds later...
-
-    Reconciler->>PG: DELETE FROM workflow_locks WHERE expires_at < NOW()
-    Note over Reconciler: Lock released
-
-    Reconciler->>PG: SELECT workflows WHERE state=CHARGING AND updated_at < 60s ago
-    Note over Reconciler: Finds the stuck CHARGING workflow
-
-    Reconciler->>Redis: RPUSH { taskType: CHARGE_MONTHLY_FEE, attempt: 1 }
-    Note over Reconciler: Re-enqueued — worker will pick up and retry
-
-    Note over Worker: Worker restarts
-
-    Worker->>Redis: BLPOP → { taskType: CHARGE_MONTHLY_FEE, attempt: 1 }
-    Worker->>PG: INSERT workflow_locks
-    Worker->>PG: SELECT idempotency_keys WHERE key="wf-id:CHARGE_MONTHLY_FEE"
-    Note over Worker: Not found → execute activity
-    Worker->>Worker: chargeMonthlyFee() ← idempotency key on Stripe prevents double charge
+```text
+Activity fails
+  -> Worker records failed attempt
+  -> Worker inserts scheduled_tasks(execute_after)
+  -> Scheduler claims due rows
+  -> Scheduler publishes to RabbitMQ
+  -> Consumer retries
 ```
 
-## Database Tables and Their Purpose
+The Scheduler's publish and `published_at` update cross two systems. Duplicate publication remains possible around crashes. Consumers must be idempotent, and a production implementation should use publisher confirms plus an outbox-oriented relay and reconciliation.
 
-### `subscription_workflows`
-The canonical state of each workflow. Every other table references this.
-The `state` column is the "program counter" of the workflow.
+## Reconciler
 
-### `workflow_events`
-Append-only history log. Every state transition, activity result, and signal is recorded here. This is NOT used for replay (unlike Temporal's history) — it's an audit log.
+The Reconciler is a backstop. It removes expired locks and finds non-terminal states that have not advanced. It creates durable repair work in `scheduled_tasks`.
 
-### `activity_attempts`
-Tracks each attempt to run each activity. Shows retry history. Lets you answer: "How many times did we try to charge customer-456 and why did each attempt fail?"
+RabbitMQ redelivery is the primary response to a dead consumer. The Reconciler handles state/queue drift that message acknowledgement alone cannot repair.
 
-### `idempotency_keys`
-Prevents duplicate execution. Before running any activity, check this table. After completing, insert a record. The worker also checks this to handle duplicate queue messages.
+## Important limitations
 
-### `workflow_locks`
-Distributed mutex. Prevents two workers from processing the same workflow simultaneously. Has a TTL so crashed workers don't permanently block workflows.
+This code is intentionally small enough to study. It omits replication, shard ownership, visibility indexing, sophisticated outbox semantics, versioned state-machine migrations, namespace isolation, archival, encryption codecs, and multi-cluster recovery.
 
-### `dead_letter_tasks`
-Activities that exhausted all retries. Requires manual intervention to re-drive or compensate.
+Those omissions are why the repository says the DIY version approximates this example rather than reproducing Temporal.
 
-## Processes and Their Responsibilities
-
-| Process | Analogy in Temporal | Responsibility |
-|---------|---------------------|----------------|
-| **API** | Temporal Client | Accept start/cancel requests, create DB records, enqueue first task |
-| **Worker** | Worker + Activity Worker | Poll Redis, acquire lock, check idempotency, execute activity, update state |
-| **Scheduler** | Temporal Server (timers) | Poll for expired `trial_end_at`, enqueue CHARGE task; promote delayed queue |
-| **Reconciler** | Temporal Server (heartbeats) | Release expired locks, detect stuck workflows, re-enqueue lost tasks |
